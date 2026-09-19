@@ -180,8 +180,10 @@ pub fn list_keyring(ring: KeyId) -> io::Result<Vec<KeyId>> {
     let raw = read(ring)?;
     Ok(raw
         .0
-        .chunks_exact(4)
-        .map(|c| KeyId::from_ne_bytes(c.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| KeyId::from_ne_bytes(*c))
         .collect())
 }
 
