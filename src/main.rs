@@ -16,28 +16,28 @@ use clap::{Args, Parser, Subcommand};
 
 use sys::{KeyId, Secret};
 
-const KEY_PREFIX: &str = "ziiring:key:";
-const SESSION_MARKER: &str = "ziiring:session";
+const KEY_PREFIX: &str = "tempkeys:key:";
+const SESSION_MARKER: &str = "tempkeys:session";
 const EXT: &str = ".enc";
 
 /// Keep a temporary keyset as encrypted files, with the key in the kernel keyring.
 ///
 /// Each secret is its own XChaCha20-Poly1305 file. Only a random 256-bit key is
-/// held by the kernel, with a timeout: when it expires (or on reboot, or `clear`)
-/// the files can no longer be decrypted and are deleted.
+/// held by the kernel, optionally with a timeout (--ttl): when it expires, on
+/// reboot, or on `clear`, the files can no longer be decrypted and are deleted.
 ///
 /// There are two scopes. The user scope keeps the key in your user keyring (@u),
 /// so every process running as your UID can use the keyset. The session scope
-/// keeps it in a private session keyring created by `ziiring session`, usable
+/// keeps it in a private session keyring created by `tempkeys session`, usable
 /// only by that process family. Outside a session everything uses the user scope.
 /// Inside one, reads (get, run, list) look in the session scope first and fall
 /// back to the user scope per keyset, while writes (load, set, clear) go to the
-/// session scope; --user and --session override this. Root can always read either. Files go in $XDG_RUNTIME_DIR/ziiring, falling
-/// back to $XDG_CACHE_HOME/ziiring (default ~/.cache/ziiring).
+/// session scope; --user and --session override this. Root can always read either. Files go in $XDG_RUNTIME_DIR/tempkeys, falling
+/// back to $XDG_CACHE_HOME/tempkeys (default ~/.cache/tempkeys).
 #[derive(Parser)]
 #[command(version)]
 struct Cli {
-    /// Use only the session scope (an error outside `ziiring session`)
+    /// Use only the session scope (an error outside `tempkeys session`)
     #[arg(long, global = true, conflicts_with = "user")]
     session: bool,
 
@@ -137,7 +137,7 @@ enum Cmd {
     Clear {
         #[command(flatten)]
         set: SetArg,
-        /// Remove every ziiring keyset in the selected scope
+        /// Remove every tempkeys keyset in the selected scope
         #[arg(long, conflicts_with = "set")]
         all: bool,
     },
@@ -147,7 +147,7 @@ enum Cmd {
     /// which inherits it. If stdin is piped, the keyset is read from it and loaded
     /// with its key in the session keyring (nothing touches @u), and COMMAND is
     /// then required because stdin is used up. Inside, use
-    /// `ziiring --session get|list|load|run|clear`.
+    /// `tempkeys --session get|list|load|run|clear`.
     Session {
         #[command(flatten)]
         set: SetArg,
@@ -184,7 +184,7 @@ impl Scope {
         Ok(Scope { label: "user", root: sys::USER_KEYRING, perm: sys::PERM_OWNER_ALL, dir: base_dir()?.join("user") })
     }
 
-    /// The session scope, if we are inside a session created by `ziiring session`.
+    /// The session scope, if we are inside a session created by `tempkeys session`.
     /// Anywhere else it is refused, which avoids dropping keys into a login's
     /// shared session keyring.
     fn try_session() -> Res<Option<Scope>> {
@@ -203,7 +203,7 @@ impl Scope {
     }
 
     fn session() -> Res<Scope> {
-        Self::try_session()?.ok_or_else(|| "not inside a ziiring session (start one with `ziiring session`)".into())
+        Self::try_session()?.ok_or_else(|| "not inside a tempkeys session (start one with `tempkeys session`)".into())
     }
 
     /// The single scope a write (load, set, clear) goes to.
@@ -249,7 +249,7 @@ fn runtime_dir() -> Option<PathBuf> {
     (dir.is_absolute() && meta.is_dir() && mine && meta.mode() & 0o077 == 0).then_some(dir)
 }
 
-/// Where ziiring keeps its files, following the XDG Base Directory spec: the
+/// Where tempkeys keeps its files, following the XDG Base Directory spec: the
 /// runtime directory (tmpfs, per login), else `$XDG_CACHE_HOME`, else `~/.cache`.
 fn base_dir() -> Res<PathBuf> {
     let env = |k: &str| std::env::var_os(k).map(PathBuf::from).filter(|v| v.is_absolute());
@@ -257,7 +257,7 @@ fn base_dir() -> Res<PathBuf> {
         .or_else(|| env("XDG_CACHE_HOME"))
         .or_else(|| env("HOME").map(|h| h.join(".cache")))
         .ok_or("cannot locate a directory: XDG_RUNTIME_DIR, XDG_CACHE_HOME and HOME are all unusable")?;
-    Ok(root.join("ziiring"))
+    Ok(root.join("tempkeys"))
 }
 
 fn mkdir_private(path: &Path) -> Res<()> {
@@ -355,7 +355,7 @@ fn drop_keys(scope: &Scope, prefix: &str, keep: Option<&str>) {
 
 fn read_stdin_keyset() -> Res<Vec<(String, Secret)>> {
     if io::stdin().is_terminal() {
-        return Err("stdin is a terminal: pipe the keyset in (e.g. `pass show env | ziiring load`)".into());
+        return Err("stdin is a terminal: pipe the keyset in (e.g. `pass show env | tempkeys load`)".into());
     }
     let mut raw = Vec::new();
     io::stdin().read_to_end(&mut raw).map_err(|e| format!("reading stdin: {e}"))?;
@@ -741,7 +741,7 @@ fn run(scopes: &[Scope], set: &str, env: &[String], quiet: bool, command: &[Stri
             .collect();
         // Inside a session a keyset can come from either scope, so say which.
         let from = if scopes.len() > 1 { format!(" (from {} keyset {set:?})", scope.label) } else { String::new() };
-        eprintln!("ziiring: populating {}{from}", list.join(" "));
+        eprintln!("tempkeys: populating {}{from}", list.join(" "));
     }
     let err = cmd.exec();
     Err(format!("exec {}: {err}", command[0]))
@@ -897,7 +897,7 @@ fn main() -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("ziiring: {e}");
+            eprintln!("tempkeys: {e}");
             ExitCode::FAILURE
         }
     }

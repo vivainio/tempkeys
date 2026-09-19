@@ -3,7 +3,7 @@
 //! One secret per file. Layout:
 //!
 //! ```text
-//! "ZIR1" | generation (16) | expiry, unix secs, BE (8) | XChaCha20 nonce (24) | ciphertext+tag
+//! "TKY1" | generation (16) | expiry, unix secs, BE (8) | XChaCha20 nonce (24) | ciphertext+tag
 //! ```
 //!
 //! The first three fields are cleartext so readers can pick the right key and
@@ -19,7 +19,7 @@ use crate::sys::Secret;
 
 pub const KEY_LEN: usize = 32;
 pub const GEN_LEN: usize = 16;
-const MAGIC: &[u8; 4] = b"ZIR1";
+const MAGIC: &[u8; 4] = b"TKY1";
 const NONCE_LEN: usize = 24;
 const HEADER_LEN: usize = 4 + GEN_LEN + 8;
 
@@ -46,7 +46,7 @@ fn aad(header: &[u8], set: &str, name: &str) -> Vec<u8> {
 /// Parse and validate the cleartext header; does not authenticate it.
 pub fn parse_header(file: &[u8]) -> Result<Header, String> {
     if file.len() < HEADER_LEN + NONCE_LEN || &file[..4] != MAGIC {
-        return Err("not a ziiring secret file".into());
+        return Err("not a tempkeys secret file".into());
     }
     Ok(Header {
         generation: file[4..4 + GEN_LEN].try_into().unwrap(),

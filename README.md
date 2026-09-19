@@ -1,4 +1,4 @@
-# ziiring
+# tempkeys
 
 Keep a **temporary keyset** on a Linux machine: send in a full set of secrets,
 use them for a while, and have them become unrecoverable on their own.
@@ -10,44 +10,44 @@ and are deleted. Keys don't expire by default; pass `--ttl` to have the kernel
 expire the key on a timer too.
 
 ```console
-$ pass show myenv | ziiring load
+$ pass show myenv | tempkeys load
 loaded 2 keys into "default", no expiry
-$ echo ghp_xxx | ziiring set GH_TOKEN      # add or replace one key
+$ echo ghp_xxx | tempkeys set GH_TOKEN      # add or replace one key
 set GH_TOKEN in "default"
-$ ziiring list
+$ tempkeys list
 default   3 keys   no expiry
-$ ziiring get API_TOKEN
+$ tempkeys get API_TOKEN
 hunter2
-$ ziiring run -e GH_TOKEN=github_token -- gh pr list
-ziiring: populating GH_TOKEN=github_token
-$ ziiring clear
+$ tempkeys run -e GH_TOKEN=github_token -- gh pr list
+tempkeys: populating GH_TOKEN=github_token
+$ tempkeys clear
 ```
 
 [keyrings]: https://man7.org/linux/man-pages/man7/keyrings.7.html
 
-## What Linux provides, and what ziiring adds
+## What Linux provides, and what tempkeys adds
 
 The hard part already exists in Linux: the [kernel key retention
 service][kernel-keys]. It holds secrets in kernel memory rather than on disk,
 checks per-key permissions and possession, expires keys on a timer, garbage
 collects them, and lets a process family share a private session keyring across
-`fork` and `exec`. `keyctl` exposes it. ziiring doesn't reimplement any of that;
+`fork` and `exec`. `keyctl` exposes it. tempkeys doesn't reimplement any of that;
 it calls the same syscalls (and the kernel's CSPRNG for keys and nonces).
 
-What the raw keyring leaves to you, and what ziiring does about it:
+What the raw keyring leaves to you, and what tempkeys does about it:
 
-| With plain `keyctl` | With ziiring |
+| With plain `keyctl` | With tempkeys |
 | --- | --- |
 | A `user` key holds at most 32 KB, and non-root users get about 200 keys and 20 KB in total (`/proc/sys/kernel/keys/`) | The kernel holds one 32-byte key per keyset. Secrets are encrypted files of any size and number |
 | A key is a single opaque payload; there is no "set of secrets" | A keyset is loaded, replaced, merged into (`load --merge`) or edited (`set`) as a unit, and swapped in atomically, so readers never see half of it |
 | Nothing ties stored data to the key's lifetime | When the key expires, is cleared, or the machine reboots, the files are unreadable and pruned, so nothing lingers on disk |
 | Data is only as safe as the permissions on it | Files are XChaCha20-Poly1305 with the keyset and key names and the expiry authenticated: swapped, moved, edited or re-dated files fail to decrypt |
-| A private per-process-family keyring is a manual recipe: join a session, set permissions, add keys, `exec` | `ziiring session` does it in the safe order: permissions are set before any key goes in, members get no right to widen access, and `--session` can't fall into your login's shared keyring |
+| A private per-process-family keyring is a manual recipe: join a session, set permissions, add keys, `exec` | `tempkeys session` does it in the safe order: permissions are set before any key goes in, members get no right to widen access, and `--session` can't fall into your login's shared keyring |
 | You choose between `@u` and `@s` for every call | Inside a session, reads look in the session scope first and fall back to the user scope per keyset, and writes go to the session; `--user` and `--session` override |
 | Getting a secret to a program means `keyctl search`, `keyctl pipe`, and your own plumbing | `get KEY`, or `run -e GH_TOKEN=github_token -- cmd`, which reports which variables it populated, names only |
 | Needs `keyutils` installed | A single binary; no `keyctl` or `libkeyutils` |
 
-ziiring adds no new trust boundary. The kernel still decides who can fetch the
+tempkeys adds no new trust boundary. The kernel still decides who can fetch the
 key (see [what this does and doesn't protect against](#what-this-does-and-doesnt-protect-against)),
 so the protection is exactly the keyring's: same-UID processes in the user
 scope, one process family in the session scope.
@@ -57,17 +57,17 @@ scope, one process family in the session scope.
 ## Install
 
 Linux only, with kernel keyring support (`CONFIG_KEYS`, on in mainstream
-distributions). No `keyctl` or `libkeyutils` needed: ziiring calls the syscalls
+distributions). No `keyctl` or `libkeyutils` needed: tempkeys calls the syscalls
 directly.
 
 ```console
-$ cargo install --git https://github.com/vivainio/ziiring
+$ cargo install --git https://github.com/vivainio/tempkeys
 ```
 
 ## Platforms
 
 Linux, including WSL2 (developed and tested on WSL2, whose kernel has keyring
-support). There is no native Windows or macOS support: ziiring depends on an
+support). There is no native Windows or macOS support: tempkeys depends on an
 in-kernel keyring with timeouts and per-process-family sessions, which those
 systems don't have. The keyring calls are isolated in `src/sys.rs`, so a port
 would replace that layer rather than rewrite the rest.
@@ -106,7 +106,7 @@ keyset the new file is encrypted under the keyset's current key and keeps its
 expiry. If the keyset doesn't exist it is created, and `--ttl` applies only then
 (use `load` to change an existing keyset's expiry). The value comes from stdin,
 or from a no-echo prompt on a terminal, never from arguments. One trailing
-newline is dropped so `echo token | ziiring set KEY` stores `token`; `--raw`
+newline is dropped so `echo token | tempkeys set KEY` stores `token`; `--raw`
 keeps the bytes exactly.
 
 The default keyset name is `default`. There is no expiry unless you pass
@@ -121,18 +121,18 @@ family exits.
 <dir>/user/default/API_TOKEN.enc     one XChaCha20-Poly1305 file per secret
 <dir>/user/default/DB_PASS.enc
 
-kernel @u:  ziiring:key:default:<generation>   32-byte key (optional timeout)
+kernel @u:  tempkeys:key:default:<generation>   32-byte key (optional timeout)
 ```
 
-`<dir>` follows the [XDG Base Directory spec][xdg]: `$XDG_RUNTIME_DIR/ziiring`
+`<dir>` follows the [XDG Base Directory spec][xdg]: `$XDG_RUNTIME_DIR/tempkeys`
 (tmpfs, cleared at logout) when that directory is usable (absolute, owned by you,
-mode `0700`), else `$XDG_CACHE_HOME/ziiring`, else `~/.cache/ziiring`. Files are
+mode `0700`), else `$XDG_CACHE_HOME/tempkeys`, else `~/.cache/tempkeys`. Files are
 mode `0600` in `0700` directories. User keysets live in `<dir>/user/`, and each
 session's in `<dir>/session-<keyring id>/`.
 
 [xdg]: https://specifications.freedesktop.org/basedir-spec/latest/
 
-**File format.** `"ZIR1" | generation (16) | expiry (8) | nonce (24) | ciphertext+tag`.
+**File format.** `"TKY1" | generation (16) | expiry (8) | nonce (24) | ciphertext+tag`.
 The header is cleartext so readers can find the right key and prune expired
 files, but it is authenticated: the associated data is the header plus the
 keyset and key names. A file can't be swapped with another key's file, moved to
@@ -145,7 +145,7 @@ then revoked. Bad input leaves the current keyset untouched.
 
 **Expiry.** The kernel enforces the key's timeout. Files whose expiry has passed,
 whose key is gone, or that belong to a dead session are deleted by the next
-`ziiring` command. Undecryptable files are useless in the meantime.
+`tempkeys` command. Undecryptable files are useless in the meantime.
 
 **Permissions.** The kernel key is owner-only (`0x003f0000`): possessor, group
 and other get nothing.
@@ -157,10 +157,10 @@ running as your UID can use. For tighter scoping, `session` puts the key in a
 private session keyring that only one process family can use:
 
 ```console
-$ pass show myenv | ziiring session --ttl 8h -- ./myapp
-$ ziiring session                       # a shell with an empty private session
-$ ziiring load                          #   ...load into the session, not @u
-$ ziiring get API_TOKEN                 #   ...and read it back
+$ pass show myenv | tempkeys session --ttl 8h -- ./myapp
+$ tempkeys session                       # a shell with an empty private session
+$ tempkeys load                          #   ...load into the session, not @u
+$ tempkeys get API_TOKEN                 #   ...and read it back
 ```
 
 `session` joins a fresh anonymous session keyring, gives it possessor-only
@@ -168,7 +168,7 @@ permissions before any key goes in, and `exec`s the command, which inherits it.
 If stdin is piped, the keyset is read from it and loaded with its key in the
 session keyring; nothing touches `@u`, and a command is then required because
 stdin is used up. Session members can add and remove keys but can't change
-permissions. The session scope exists only inside a session that ziiring
+permissions. The session scope exists only inside a session that tempkeys
 created, so secrets can't land in your login's shared session keyring by mistake.
 
 The keyset lasts as long as the process family, or the TTL, whichever ends first.
@@ -205,7 +205,7 @@ keyset name in both never mixes.
   when the application can call it.
 - **Root** can read anything, and ptrace-based inspection of a process that has
   decrypted a secret is out of scope. A revoked key can't erase copies already
-  read into memory. Best-effort zeroing is done on ziiring's own buffers only.
+  read into memory. Best-effort zeroing is done on tempkeys's own buffers only.
 
 ## Limits
 
@@ -214,7 +214,7 @@ keyset name in both never mixes.
   is text-only (UTF-8 dotenv or JSON), and `run` can't inject a value containing
   a NUL byte, since environment variables can't hold one.
 - Non-root users have kernel key quotas (`/proc/sys/kernel/keys/maxkeys` and
-  `maxbytes`). ziiring stores one 32-byte key per keyset, so this is rarely an
+  `maxbytes`). tempkeys stores one 32-byte key per keyset, so this is rarely an
   issue.
 
 ## Background
