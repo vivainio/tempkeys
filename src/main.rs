@@ -133,6 +133,25 @@ enum Cmd {
         #[arg(trailing_var_arg = true, required = true, num_args = 1.., allow_hyphen_values = true)]
         command: Vec<String>,
     },
+    /// Serve a Git HTTPS credential from a key in the selected keyset.
+    ///
+    /// Configure as a Git credential helper for a specific host. Only `get`
+    /// returns credentials; `store` and `erase` do not change the keyset.
+    GitCredential {
+        #[command(flatten)]
+        set: SetArg,
+        /// Name of the token key
+        #[arg(long, default_value = "GH_TOKEN")]
+        key: String,
+        /// HTTPS host to answer for
+        #[arg(long, default_value = "github.com")]
+        host: String,
+        /// Nonempty username sent with the token
+        #[arg(long, default_value = "x-access-token")]
+        username: String,
+        /// Git credential helper operation
+        operation: String,
+    },
     /// Delete a keyset (or all of them) and its encryption key right now
     Clear {
         #[command(flatten)]
@@ -753,6 +772,78 @@ fn read_secret(scope: &Scope, set: &str, name: &str) -> Res<Secret> {
     vault::decrypt(&key.0, &file, set, name)
 }
 
+fn git_credential_noop(operation: &str) -> Res<()> {
+    match operation {
+        "store" | "erase" => Ok(()),
+        _ => Err(format!(
+            "unsupported Git credential operation {operation:?}"
+        )),
+    }
+}
+
+const MAX_CREDENTIAL_REQUEST: u64 = 64 * 1024;
+
+fn credential_request_matches(request: &str, host: &str) -> bool {
+    let mut protocol = None;
+    let mut requested_host = None;
+    for line in request.lines().take_while(|line| !line.is_empty()) {
+        if let Some((name, value)) = line.split_once('=') {
+            match name {
+                "protocol" => protocol = Some(value),
+                "host" => requested_host = Some(value),
+                _ => {}
+            }
+        }
+    }
+    protocol == Some("https") && requested_host == Some(host)
+}
+
+fn git_credential(
+    scopes: &[Scope],
+    set: &str,
+    key: &str,
+    host: &str,
+    username: &str,
+    operation: &str,
+) -> Res<()> {
+    if operation == "store" || operation == "erase" {
+        return Ok(());
+    }
+    if operation != "get" {
+        return Err(format!(
+            "unsupported Git credential operation {operation:?}"
+        ));
+    }
+    if username.is_empty()
+        || username.contains(['\n', '\r', '='])
+        || host.is_empty()
+        || host.contains(['\n', '\r'])
+    {
+        return Err("invalid credential username or host".into());
+    }
+    let mut request = String::new();
+    io::stdin()
+        .take(MAX_CREDENTIAL_REQUEST + 1)
+        .read_to_string(&mut request)
+        .map_err(|e| format!("reading Git credential request: {e}"))?;
+    if request.len() as u64 > MAX_CREDENTIAL_REQUEST {
+        return Err("Git credential request is too large".into());
+    }
+    if !credential_request_matches(&request, host) {
+        return Ok(());
+    }
+    let scope = pick(scopes, set)?;
+    let value = read_secret(&scope, set, key)?;
+    if value.0.is_empty() || value.0.contains(&b'\n') || value.0.contains(&b'\r') {
+        return Err(format!("key {key:?} cannot be used as a Git credential"));
+    }
+    let mut out = io::stdout().lock();
+    write!(out, "username={username}\npassword=").map_err(|e| e.to_string())?;
+    out.write_all(&value.0).map_err(|e| e.to_string())?;
+    out.write_all(b"\n\n").map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 fn get(scope: &Scope, set: &str, key: &str) -> Res<()> {
     let value = read_secret(scope, set, key)?;
     let mut out = io::stdout().lock();
@@ -1018,6 +1109,9 @@ fn main() -> ExitCode {
             prune(std::slice::from_ref(&s));
             set_key(&s, &set.set, ttl.ttl, key, *raw)
         }),
+        Cmd::GitCredential { operation, .. } if operation != "get" => {
+            git_credential_noop(operation)
+        }
         Cmd::Clear { set, all } => Scope::for_write(target).and_then(|s| {
             prune(std::slice::from_ref(&s));
             clear(&s, &set.set, *all)
@@ -1026,6 +1120,13 @@ fn main() -> ExitCode {
             prune(&scopes);
             match read {
                 Cmd::Get { set, key } => get(&pick(&scopes, &set.set)?, &set.set, key),
+                Cmd::GitCredential {
+                    set,
+                    key,
+                    host,
+                    username,
+                    operation,
+                } => git_credential(&scopes, &set.set, key, host, username, operation),
                 Cmd::List { set } => list(&scopes, set.as_deref()),
                 Cmd::Run {
                     set,
@@ -1043,5 +1144,37 @@ fn main() -> ExitCode {
             eprintln!("tempkeys: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod credential_tests {
+    use super::*;
+
+    #[test]
+    fn only_matches_https_for_the_configured_host() {
+        assert!(credential_request_matches(
+            "protocol=https\nhost=github.com\n\n",
+            "github.com"
+        ));
+        assert!(!credential_request_matches(
+            "protocol=http\nhost=github.com\n\n",
+            "github.com"
+        ));
+        assert!(!credential_request_matches(
+            "protocol=https\nhost=other.example\n\n",
+            "github.com"
+        ));
+        assert!(!credential_request_matches(
+            "protocol=https\nhost=github.com.evil.example\n\n",
+            "github.com"
+        ));
+    }
+
+    #[test]
+    fn store_and_erase_do_not_require_a_keyset() {
+        assert!(git_credential_noop("store").is_ok());
+        assert!(git_credential_noop("erase").is_ok());
+        assert!(git_credential_noop("unknown").is_err());
     }
 }

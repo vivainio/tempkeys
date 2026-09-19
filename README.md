@@ -81,6 +81,7 @@ would replace that layer rather than rewrite the rest.
 | `get [--set NAME] KEY` | Decrypt and print one key's raw value |
 | `list [--set NAME]` | List keysets, or key names in one (never values) |
 | `run [--set NAME] [-e VAR=KEY]... -- CMD...` | Run a command with keys as environment variables |
+| `git-credential [--set NAME] [--key KEY] [--host HOST] [--username NAME] get` | Serve a token to Git for HTTPS credentials |
 | `clear [--set NAME \| --all]` | Delete a keyset and its encryption key now |
 | `session [--set NAME] [--ttl DUR] [-- CMD...]` | Start a command in a private session keyring (see below) |
 
@@ -114,6 +115,26 @@ The default keyset name is `default`. There is no expiry unless you pass
 timer, and the files are deleted once it does. Without one, the keyset lasts
 until you `clear` it, the machine reboots, or (in session mode) the process
 family exits.
+
+## Git HTTPS credential helper
+
+`tempkeys git-credential` implements Git's credential helper protocol. It reads
+`GH_TOKEN` from the default keyset when Git requests credentials for
+`https://github.com`. The default username is `x-access-token`; GitHub uses the
+token for authentication, so the username does not need to be stored. Configure
+Git for this host with:
+
+```console
+$ git config --global --replace-all credential.https://github.com.helper ''
+$ git config --global --add credential.https://github.com.helper '!tempkeys --user git-credential'
+```
+
+The empty helper setting resets previously configured helpers for this host.
+`--user` always reads the user keyring, even inside a tempkeys session. The
+helper returns credentials only for the configured HTTPS host. `store` and
+`erase` do nothing; no token is written to Git's credential files. Use
+`--set`, `--key`, `--host`, or `--username` to change the defaults. SSH Git
+remotes use SSH keys and do not call this helper.
 
 ## How it works
 
