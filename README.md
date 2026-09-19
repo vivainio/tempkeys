@@ -4,20 +4,23 @@ Keep a **temporary keyset** on a Linux machine: send in a full set of secrets,
 use them for a while, and have them become unrecoverable on their own.
 
 Each secret is stored as its own encrypted file. The only thing the kernel holds
-is the random encryption key, in the [Linux kernel keyring][keyrings], with a
-timeout. When the key expires, is cleared, or the machine reboots, the files can
-no longer be decrypted and are deleted.
+is the random encryption key, in the [Linux kernel keyring][keyrings]. When the
+machine reboots or you `clear` the keyset, the files can no longer be decrypted
+and are deleted. Keys don't expire by default; pass `--ttl` to have the kernel
+expire the key on a timer too.
 
 ```console
-$ pass show myenv | ziiring load --ttl 8h
-loaded 2 keys into "default", expires in 8h
+$ pass show myenv | ziiring load
+loaded 2 keys into "default", no expiry
+$ echo ghp_xxx | ziiring set GH_TOKEN      # add or replace one key
+set GH_TOKEN in "default"
 $ ziiring list
-default   2 keys   expires in 7h
+default   3 keys   no expiry
 $ ziiring get API_TOKEN
 hunter2
 $ ziiring run -e GH_TOKEN=github_token -- gh pr list
 ziiring: populating GH_TOKEN=github_token
-$ ziiring clear                 # or just wait
+$ ziiring clear
 ```
 
 [keyrings]: https://man7.org/linux/man-pages/man7/keyrings.7.html
@@ -36,12 +39,13 @@ $ cargo install --git https://github.com/vivainio/ziiring
 
 | Command | What it does |
 | --- | --- |
-| `load [--set NAME] [--ttl 1h]` | Replace a keyset with the full set read from stdin |
+| `load [--set NAME] [--ttl DUR]` | Replace a keyset with the full set read from stdin |
+| `set [--set NAME] [--ttl DUR] [--raw] KEY` | Add or replace one key, value from stdin |
 | `get [--set NAME] KEY` | Decrypt and print one key's raw value |
 | `list [--set NAME]` | List keysets, or key names in one (never values) |
 | `run [--set NAME] [-e VAR=KEY]... -- CMD...` | Run a command with keys as environment variables |
 | `clear [--set NAME \| --all]` | Delete a keyset and its encryption key now |
-| `session [--set NAME] [--ttl 1h] [-- CMD...]` | Start a command in a private session keyring (see below) |
+| `session [--set NAME] [--ttl DUR] [-- CMD...]` | Start a command in a private session keyring (see below) |
 
 `load` reads dotenv lines (`KEY=VALUE`, `#` comments, optional `export`, one
 pair of surrounding quotes stripped) or a JSON object of strings. Key names must
@@ -56,8 +60,19 @@ read from stdin, never from arguments. Empty values are rejected.
 nothing else from the keyset. Without `-e`, every key is injected under its own
 name. A missing key fails before the command starts. `-q` silences the listing.
 
-The default keyset name is `default`, and the default TTL is one hour (`90s`,
-`15m`, `8h`, `2d`).
+`set` adds or replaces a single key without touching the rest. In an existing
+keyset the new file is encrypted under the keyset's current key and keeps its
+expiry. If the keyset doesn't exist it is created, and `--ttl` applies only then
+(use `load` to change an existing keyset's expiry). The value comes from stdin,
+or from a no-echo prompt on a terminal, never from arguments. One trailing
+newline is dropped so `echo token | ziiring set KEY` stores `token`; `--raw`
+keeps the bytes exactly.
+
+The default keyset name is `default`. There is no expiry unless you pass
+`--ttl` (`90s`, `15m`, `8h`, `2d`): the kernel then expires the key on that
+timer, and the files are deleted once it does. Without one, the keyset lasts
+until you `clear` it, the machine reboots, or (in session mode) the process
+family exits.
 
 ## How it works
 
@@ -65,7 +80,7 @@ The default keyset name is `default`, and the default TTL is one hour (`90s`,
 <dir>/user/default/API_TOKEN.enc     one XChaCha20-Poly1305 file per secret
 <dir>/user/default/DB_PASS.enc
 
-kernel @u:  ziiring:key:default:<generation>   32-byte key, with a timeout
+kernel @u:  ziiring:key:default:<generation>   32-byte key (optional timeout)
 ```
 
 `<dir>` is `$ZIIRING_DIR`, else `$XDG_RUNTIME_DIR/ziiring`, else
@@ -130,8 +145,10 @@ The keyset lasts as long as the process family, or the TTL, whichever ends first
 
 ## Limits
 
-- Input is UTF-8 text (dotenv or JSON). The file format handles arbitrary bytes,
-  but there is no way to load binary files (certificates, keys) yet.
+- **Values are raw bytes**: files hold the exact payload, any size, and `get`
+  returns it unchanged. `set --raw KEY < cert.der` stores binary data. `load`
+  is text-only (UTF-8 dotenv or JSON), and `run` can't inject a value containing
+  a NUL byte, since environment variables can't hold one.
 - Non-root users have kernel key quotas (`/proc/sys/kernel/keys/maxkeys` and
   `maxbytes`). ziiring stores one 32-byte key per keyset, so this is rarely an
   issue.

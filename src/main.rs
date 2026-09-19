@@ -51,9 +51,9 @@ struct SetArg {
 
 #[derive(Args)]
 struct TtlArg {
-    /// Lifetime, e.g. 90s, 15m, 8h, 2d
-    #[arg(long, default_value = "1h", value_parser = parse_ttl)]
-    ttl: u32,
+    /// Expire after this long, e.g. 90s, 15m, 8h, 2d (default: no expiry)
+    #[arg(long, value_parser = parse_ttl)]
+    ttl: Option<u32>,
 }
 
 #[derive(Subcommand)]
@@ -68,6 +68,23 @@ enum Cmd {
         set: SetArg,
         #[command(flatten)]
         ttl: TtlArg,
+    },
+    /// Add or replace one key, reading its value from stdin.
+    ///
+    /// In an existing keyset the key is encrypted under the keyset's current key
+    /// and keeps its expiry; the other keys are untouched. If the keyset doesn't
+    /// exist it is created (--ttl applies only then). One trailing newline is
+    /// dropped from the value unless --raw is given. On a terminal the value is
+    /// prompted for without echo.
+    Set {
+        #[command(flatten)]
+        set: SetArg,
+        #[command(flatten)]
+        ttl: TtlArg,
+        /// Keep the value's bytes exactly, including a trailing newline
+        #[arg(long)]
+        raw: bool,
+        key: String,
     },
     /// Decrypt and print one key's raw value
     Get {
@@ -205,6 +222,13 @@ fn parse_ttl(s: &str) -> Res<u32> {
     u32::try_from(secs).map_err(|_| "duration too long".into())
 }
 
+/// Expiry recorded in files that never expire.
+const NEVER: u64 = u64::MAX;
+
+fn fmt_expiry(ttl: Option<u32>) -> String {
+    ttl.map_or("no expiry".to_string(), |t| format!("expires in {}", fmt_ttl(u64::from(t))))
+}
+
 fn fmt_ttl(s: u64) -> String {
     match s {
         s if s >= 86400 && s % 86400 == 0 => format!("{}d", s / 86400),
@@ -274,7 +298,7 @@ fn read_stdin_keyset() -> Res<Vec<(String, Secret)>> {
 }
 
 /// Replace `set` in `scope` with `entries`, encrypted under a fresh key.
-fn store_keyset(scope: &Scope, set: &str, ttl: u32, entries: &[(String, Secret)]) -> Res<()> {
+fn store_keyset(scope: &Scope, set: &str, ttl: Option<u32>, entries: &[(String, Secret)]) -> Res<()> {
     check_set(set)?;
     let key = sys::random(vault::KEY_LEN).map_err(|e| os_err("random key", e))?;
     let generation: vault::Generation = sys::random(vault::GEN_LEN)
@@ -283,14 +307,16 @@ fn store_keyset(scope: &Scope, set: &str, ttl: u32, entries: &[(String, Secret)]
         .clone()
         .try_into()
         .unwrap();
-    let expiry = now() + u64::from(ttl);
+    let expiry = ttl.map_or(NEVER, |t| now() + u64::from(t));
 
     // The kernel key goes in first: files are unreadable without it, never the reverse.
     let desc = key_desc(set, &generation);
     let key_id = sys::add_user_key(&desc, &key.0, scope.root).map_err(|e| os_err("storing encryption key", e))?;
     // Timeout and permissions need setattr, so tighten permissions last.
     let seal = || -> Res<()> {
-        sys::set_timeout(key_id, ttl).map_err(|e| os_err("setting key timeout", e))?;
+        if let Some(ttl) = ttl {
+            sys::set_timeout(key_id, ttl).map_err(|e| os_err("setting key timeout", e))?;
+        }
         sys::set_perm(key_id, scope.perm).map_err(|e| os_err("restricting key", e))
     };
     if let Err(e) = seal() {
@@ -336,10 +362,97 @@ fn store_keyset(scope: &Scope, set: &str, ttl: u32, entries: &[(String, Secret)]
     Ok(())
 }
 
-fn load(scope: &Scope, set: &str, ttl: u32) -> Res<()> {
+/// Read one value from stdin, prompting without echo on a terminal.
+fn read_value(key: &str, raw: bool) -> Res<Secret> {
+    let mut buf = Secret(Vec::new());
+    if io::stdin().is_terminal() {
+        eprint!("Value for {key}: ");
+        // SAFETY: termios is plain data; fd 0 is stdin. Echo is restored below.
+        let saved = unsafe {
+            let mut t: libc::termios = std::mem::zeroed();
+            (libc::tcgetattr(0, &mut t) == 0).then(|| {
+                let saved = t;
+                t.c_lflag &= !libc::ECHO;
+                libc::tcsetattr(0, libc::TCSANOW, &t);
+                saved
+            })
+        };
+        let mut line = String::new();
+        let read = io::stdin().read_line(&mut line);
+        if let Some(saved) = saved {
+            // SAFETY: restoring the attributes captured above.
+            unsafe { libc::tcsetattr(0, libc::TCSANOW, &saved) };
+        }
+        eprintln!();
+        read.map_err(|e| format!("reading value: {e}"))?;
+        buf = Secret(std::mem::take(&mut line).into_bytes());
+    } else {
+        io::stdin().read_to_end(&mut buf.0).map_err(|e| format!("reading stdin: {e}"))?;
+    }
+    if !raw {
+        if buf.0.last() == Some(&b'\n') {
+            buf.0.pop();
+            if buf.0.last() == Some(&b'\r') {
+                buf.0.pop();
+            }
+        }
+    }
+    if buf.0.is_empty() {
+        return Err("empty values are not supported".into());
+    }
+    Ok(buf)
+}
+
+fn set_key(scope: &Scope, set: &str, ttl: Option<u32>, key: &str, raw: bool) -> Res<()> {
+    check_set(set)?;
+    if !parse::valid_name(key) {
+        return Err(format!("invalid key name {key:?} (use letters, digits, underscore)"));
+    }
+    let dir = scope.dir.join(set);
+    let existing = key_names(&dir)
+        .ok()
+        .and_then(|names| names.into_iter().next())
+        .map(|first| fs::read(dir.join(format!("{first}{EXT}"))).map_err(|e| format!("reading keyset: {e}")))
+        .transpose()?
+        .map(|f| vault::parse_header(&f))
+        .transpose()?;
+    let value = read_value(key, raw)?;
+
+    let Some(header) = existing else {
+        store_keyset(scope, set, ttl, &[(key.to_string(), value)])?;
+        eprintln!("created keyset {set:?} with {key}, {}", fmt_expiry(ttl));
+        return Ok(());
+    };
+    if ttl.is_some() {
+        return Err(format!("keyset {set:?} already exists; --ttl applies only to a new keyset (use `load` to change expiry)"));
+    }
+    let enc_key = find_key(scope, set, &header.generation)?
+        .ok_or_else(|| format!("keyset {set:?} is locked: its encryption key expired or was cleared"))?;
+    let nonce: [u8; 24] = sys::random(24).map_err(|e| os_err("random nonce", e))?.0.clone().try_into().unwrap();
+    let file = vault::encrypt(&enc_key.0, &header.generation, header.expiry, set, key, &value.0, &nonce)?;
+
+    // Write beside the target and rename over it, so readers see the old or new file, never a partial one.
+    let tmp = dir.join(format!(".{key}.tmp-{}", std::process::id()));
+    let _ = fs::remove_file(&tmp);
+    let write = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)
+        .and_then(|mut f| f.write_all(&file))
+        .and_then(|()| fs::rename(&tmp, dir.join(format!("{key}{EXT}"))));
+    if let Err(e) = write {
+        let _ = fs::remove_file(&tmp);
+        return Err(format!("writing {key}: {e}"));
+    }
+    eprintln!("set {key} in {set:?}");
+    Ok(())
+}
+
+fn load(scope: &Scope, set: &str, ttl: Option<u32>) -> Res<()> {
     let entries = read_stdin_keyset()?;
     store_keyset(scope, set, ttl, &entries)?;
-    eprintln!("loaded {} keys into {set:?}, expires in {}", entries.len(), fmt_ttl(u64::from(ttl)));
+    eprintln!("loaded {} keys into {set:?}, {}", entries.len(), fmt_expiry(ttl));
     Ok(())
 }
 
@@ -427,6 +540,7 @@ fn list(scope: &Scope, set: Option<&str>) -> Res<()> {
                     .and_then(|k| fs::read(dir.join(format!("{k}{EXT}"))).ok())
                     .and_then(|f| vault::parse_header(&f).ok())
                     .map(|h| match find_key(scope, &name, &h.generation) {
+                        Ok(Some(_)) if h.expiry == NEVER => "no expiry".to_string(),
                         Ok(Some(_)) => format!("expires in {}", fmt_left(h.expiry.saturating_sub(now()))),
                         _ => "locked".to_string(),
                     })
@@ -467,6 +581,9 @@ fn run(scope: &Scope, set: &str, env: &[String], quiet: bool, command: &[String]
     cmd.args(&command[1..]);
     for (var, key) in &mappings {
         let value = read_secret(scope, set, key)?;
+        if value.0.contains(&0) {
+            return Err(format!("key {key} contains a NUL byte and can't be an environment variable (use `get`)"));
+        }
         cmd.env(var, OsStr::from_bytes(&value.0));
     }
     if !quiet {
@@ -563,7 +680,7 @@ fn prune(scope: Option<&Scope>) {
     }
 }
 
-fn session(set: &str, ttl: u32, command: &[String]) -> Res<()> {
+fn session(set: &str, ttl: Option<u32>, command: &[String]) -> Res<()> {
     let piped = !io::stdin().is_terminal();
     if piped && command.is_empty() {
         return Err("stdin is piped into the keyset, so a COMMAND is required".into());
@@ -581,7 +698,7 @@ fn session(set: &str, ttl: u32, command: &[String]) -> Res<()> {
     prune(Some(&scope));
     if let Some(entries) = &entries {
         store_keyset(&scope, set, ttl, entries)?;
-        eprintln!("loaded {} keys into session keyset {set:?}, expires in {}", entries.len(), fmt_ttl(u64::from(ttl)));
+        eprintln!("loaded {} keys into session keyset {set:?}, {}", entries.len(), fmt_expiry(ttl));
     }
     // Members may add and remove keys but never change permissions.
     sys::set_perm(ring, sys::PERM_POSSESSOR_NO_SETATTR).map_err(|e| os_err("restricting session keyring", e))?;
@@ -606,6 +723,7 @@ fn main() -> ExitCode {
                 prune(Some(&s));
                 match cmd {
                     Cmd::Load { set, ttl } => load(&s, &set.set, ttl.ttl),
+                    Cmd::Set { set, ttl, raw, key } => set_key(&s, &set.set, ttl.ttl, key, *raw),
                     Cmd::Get { set, key } => get(&s, &set.set, key),
                     Cmd::List { set } => list(&s, set.as_deref()),
                     Cmd::Run { set, env, quiet, command } => run(&s, &set.set, env, *quiet, command),
