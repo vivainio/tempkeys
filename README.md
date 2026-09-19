@@ -9,6 +9,20 @@ machine reboots or you `clear` the keyset, the files can no longer be decrypted
 and are deleted. Keys don't expire by default; pass `--ttl` to have the kernel
 expire the key on a timer too.
 
+This is handy when you need to send keys to another machine. Stream a keyset
+through SSH into `tempkeys load`, then query individual keys on the remote host
+only when needed:
+
+```console
+$ pass show myenv | ssh user@box 'tempkeys --user load'
+$ ssh user@box 'tempkeys --user get API_TOKEN'
+```
+
+The remote host keeps encrypted files and a kernel-held key, without writing
+plaintext secrets to its filesystem or keeping them in long-lived environment
+variables. `get` prints a secret to stdout when requested; `run` can instead
+pass selected keys to one command's environment when that command requires it.
+
 ```console
 $ pass show myenv | tempkeys load
 loaded 2 keys into "default", no expiry
