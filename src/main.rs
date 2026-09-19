@@ -81,7 +81,12 @@ enum Cmd {
         #[arg(long, short)]
         set: Option<String>,
     },
-    /// Run a command with the keyset injected as environment variables.
+    /// Run a command with keys injected as environment variables.
+    ///
+    /// Without -e, every key in the keyset is injected under its own name. With
+    /// -e, only the listed variables are populated. Either way the variables set
+    /// are listed on stderr (names only, never values) as VAR=KEY, or just VAR
+    /// when the variable has the key's name.
     ///
     /// Environment variables are visible to same-UID readers of /proc/PID/environ
     /// and are inherited by grandchildren, so this trades protection for
@@ -89,6 +94,12 @@ enum Cmd {
     Run {
         #[command(flatten)]
         set: SetArg,
+        /// Populate VAR from key KEY (repeatable); VAR alone means KEY = VAR
+        #[arg(short = 'e', long = "env", value_name = "VAR=KEY")]
+        env: Vec<String>,
+        /// Don't list the populated variables
+        #[arg(short, long)]
+        quiet: bool,
         #[arg(trailing_var_arg = true, required = true, num_args = 1.., allow_hyphen_values = true)]
         command: Vec<String>,
     },
@@ -427,14 +438,43 @@ fn list(scope: &Scope, set: Option<&str>) -> Res<()> {
     Ok(())
 }
 
-fn run(scope: &Scope, set: &str, command: &[String]) -> Res<()> {
+/// `VAR=KEY` (or `VAR`, meaning `VAR=VAR`) into (variable, key).
+fn parse_mapping(spec: &str) -> Res<(String, String)> {
+    let (var, key) = spec.split_once('=').unwrap_or((spec, spec));
+    for (what, name) in [("variable", var), ("key", key)] {
+        if !parse::valid_name(name) {
+            return Err(format!("bad -e {spec:?}: invalid {what} name {name:?}"));
+        }
+    }
+    Ok((var.to_string(), key.to_string()))
+}
+
+fn run(scope: &Scope, set: &str, env: &[String], quiet: bool, command: &[String]) -> Res<()> {
     check_set(set)?;
-    let names = key_names(&scope.dir.join(set)).map_err(|_| format!("no keyset {set:?}"))?;
+    let mut mappings = if env.is_empty() {
+        let names = key_names(&scope.dir.join(set)).map_err(|_| format!("no keyset {set:?}"))?;
+        names.into_iter().map(|n| (n.clone(), n)).collect()
+    } else {
+        env.iter().map(|spec| parse_mapping(spec)).collect::<Res<Vec<_>>>()?
+    };
+    mappings.sort();
+    if let Some(w) = mappings.windows(2).find(|w| w[0].0 == w[1].0) {
+        return Err(format!("variable {} is mapped more than once", w[0].0));
+    }
+
+    // Decrypt everything first: a missing key fails before anything is launched.
     let mut cmd = Command::new(&command[0]);
     cmd.args(&command[1..]);
-    for name in names {
-        let value = read_secret(scope, set, &name)?;
-        cmd.env(&name, OsStr::from_bytes(&value.0));
+    for (var, key) in &mappings {
+        let value = read_secret(scope, set, key)?;
+        cmd.env(var, OsStr::from_bytes(&value.0));
+    }
+    if !quiet {
+        let list: Vec<String> = mappings
+            .iter()
+            .map(|(var, key)| if var == key { var.clone() } else { format!("{var}={key}") })
+            .collect();
+        eprintln!("ziiring: populating {}", list.join(" "));
     }
     let err = cmd.exec();
     Err(format!("exec {}: {err}", command[0]))
@@ -568,7 +608,7 @@ fn main() -> ExitCode {
                     Cmd::Load { set, ttl } => load(&s, &set.set, ttl.ttl),
                     Cmd::Get { set, key } => get(&s, &set.set, key),
                     Cmd::List { set } => list(&s, set.as_deref()),
-                    Cmd::Run { set, command } => run(&s, &set.set, command),
+                    Cmd::Run { set, env, quiet, command } => run(&s, &set.set, env, *quiet, command),
                     Cmd::Clear { set, all } => clear(&s, &set.set, *all),
                     Cmd::Session { .. } => unreachable!(),
                 }
