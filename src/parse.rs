@@ -18,10 +18,14 @@ pub fn parse_keyset(input: &str) -> Result<Vec<(String, Secret)>, String> {
     let mut seen = std::collections::HashSet::new();
     for (name, value) in &entries {
         if !valid_name(name) {
-            return Err(format!("invalid key name {name:?} (use letters, digits, underscore)"));
+            return Err(format!(
+                "invalid key name {name:?} (use letters, digits, underscore)"
+            ));
         }
         if value.0.is_empty() {
-            return Err(format!("{name}: empty values are not supported by kernel user keys"));
+            return Err(format!(
+                "{name}: empty values are not supported by kernel user keys"
+            ));
         }
         if !seen.insert(name.clone()) {
             return Err(format!("duplicate key {name}"));
@@ -34,7 +38,8 @@ pub fn parse_keyset(input: &str) -> Result<Vec<(String, Secret)>, String> {
 }
 
 fn parse_json(input: &str) -> Result<Vec<(String, Secret)>, String> {
-    let value: serde_json::Value = serde_json::from_str(input).map_err(|e| format!("bad JSON: {e}"))?;
+    let value: serde_json::Value =
+        serde_json::from_str(input).map_err(|e| format!("bad JSON: {e}"))?;
     let obj = value.as_object().ok_or("JSON keyset must be an object")?;
     obj.iter()
         .map(|(k, v)| match v {
@@ -55,7 +60,10 @@ fn parse_env(input: &str) -> Result<Vec<(String, Secret)>, String> {
         let (name, value) = line
             .split_once('=')
             .ok_or_else(|| format!("line {}: expected KEY=VALUE", i + 1))?;
-        out.push((name.trim().to_string(), Secret(unquote(value.trim()).into_bytes())));
+        out.push((
+            name.trim().to_string(),
+            Secret(unquote(value.trim()).into_bytes()),
+        ));
     }
     Ok(out)
 }
@@ -95,7 +103,10 @@ mod tests {
 
     #[test]
     fn json() {
-        assert_eq!(names(r#"{"A":"1"}"#), vec![("A".to_string(), "1".to_string())]);
+        assert_eq!(
+            names(r#"{"A":"1"}"#),
+            vec![("A".to_string(), "1".to_string())]
+        );
         assert!(parse_keyset(r#"{"A":1}"#).is_err());
     }
 

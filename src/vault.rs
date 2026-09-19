@@ -71,7 +71,10 @@ pub fn encrypt(
     let sealed = cipher
         .encrypt(
             &XNonce::from(*nonce),
-            Payload { msg: plaintext, aad: &aad(&out, set, name) },
+            Payload {
+                msg: plaintext,
+                aad: &aad(&out, set, name),
+            },
         )
         .map_err(|_| "encryption failed")?;
     out.extend_from_slice(nonce);
@@ -86,7 +89,13 @@ pub fn decrypt(key: &[u8], file: &[u8], set: &str, name: &str) -> Result<Secret,
     let cipher = XChaCha20Poly1305::new_from_slice(key).map_err(|_| "bad key length")?;
     let nonce = XNonce::try_from(nonce).map_err(|_| "bad nonce")?;
     cipher
-        .decrypt(&nonce, Payload { msg: sealed, aad: &aad(header, set, name) })
+        .decrypt(
+            &nonce,
+            Payload {
+                msg: sealed,
+                aad: &aad(header, set, name),
+            },
+        )
         .map(Secret)
         .map_err(|_| "decryption failed: wrong key, or the file was modified or moved".into())
 }

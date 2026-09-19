@@ -181,7 +181,12 @@ struct Scope {
 impl Scope {
     fn user() -> Res<Scope> {
         // Owner-only: any process of this UID, no one else.
-        Ok(Scope { label: "user", root: sys::USER_KEYRING, perm: sys::PERM_OWNER_ALL, dir: base_dir()?.join("user") })
+        Ok(Scope {
+            label: "user",
+            root: sys::USER_KEYRING,
+            perm: sys::PERM_OWNER_ALL,
+            dir: base_dir()?.join("user"),
+        })
     }
 
     /// The session scope, if we are inside a session created by `tempkeys session`.
@@ -193,7 +198,8 @@ impl Scope {
         if marker.is_none() {
             return Ok(None);
         }
-        let serial = sys::serial(sys::SESSION_KEYRING).map_err(|e| os_err("resolving session keyring", e))?;
+        let serial = sys::serial(sys::SESSION_KEYRING)
+            .map_err(|e| os_err("resolving session keyring", e))?;
         Ok(Some(Scope {
             label: "session",
             root: sys::SESSION_KEYRING,
@@ -203,7 +209,9 @@ impl Scope {
     }
 
     fn session() -> Res<Scope> {
-        Self::try_session()?.ok_or_else(|| "not inside a tempkeys session (start one with `tempkeys session`)".into())
+        Self::try_session()?.ok_or_else(|| {
+            "not inside a tempkeys session (start one with `tempkeys session`)".into()
+        })
     }
 
     /// The single scope a write (load, set, clear) goes to.
@@ -223,7 +231,10 @@ impl Scope {
         Ok(match target {
             Target::User => vec![Scope::user()?],
             Target::Session => vec![Scope::session()?],
-            Target::Auto => Scope::try_session()?.into_iter().chain([Scope::user()?]).collect(),
+            Target::Auto => Scope::try_session()?
+                .into_iter()
+                .chain([Scope::user()?])
+                .collect(),
         })
     }
 }
@@ -233,8 +244,13 @@ impl Scope {
 /// keyset it is used whole, and a key missing from it is not taken from another.
 fn pick(scopes: &[Scope], set: &str) -> Res<Scope> {
     check_set(set)?;
-    let found = scopes.iter().find(|s| s.dir.join(set).is_dir()).or(scopes.first());
-    found.cloned().ok_or_else(|| "no scope available".to_string())
+    let found = scopes
+        .iter()
+        .find(|s| s.dir.join(set).is_dir())
+        .or(scopes.first());
+    found
+        .cloned()
+        .ok_or_else(|| "no scope available".to_string())
 }
 
 const SESSION_DIR_PREFIX: &str = "session-";
@@ -252,11 +268,17 @@ fn runtime_dir() -> Option<PathBuf> {
 /// Where tempkeys keeps its files, following the XDG Base Directory spec: the
 /// runtime directory (tmpfs, per login), else `$XDG_CACHE_HOME`, else `~/.cache`.
 fn base_dir() -> Res<PathBuf> {
-    let env = |k: &str| std::env::var_os(k).map(PathBuf::from).filter(|v| v.is_absolute());
+    let env = |k: &str| {
+        std::env::var_os(k)
+            .map(PathBuf::from)
+            .filter(|v| v.is_absolute())
+    };
     let root = runtime_dir()
         .or_else(|| env("XDG_CACHE_HOME"))
         .or_else(|| env("HOME").map(|h| h.join(".cache")))
-        .ok_or("cannot locate a directory: XDG_RUNTIME_DIR, XDG_CACHE_HOME and HOME are all unusable")?;
+        .ok_or(
+            "cannot locate a directory: XDG_RUNTIME_DIR, XDG_CACHE_HOME and HOME are all unusable",
+        )?;
     Ok(root.join("tempkeys"))
 }
 
@@ -269,7 +291,9 @@ fn mkdir_private(path: &Path) -> Res<()> {
 }
 
 fn now() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 fn parse_ttl(s: &str) -> Res<u32> {
@@ -293,7 +317,9 @@ fn parse_ttl(s: &str) -> Res<u32> {
 const NEVER: u64 = u64::MAX;
 
 fn fmt_expiry(ttl: Option<u32>) -> String {
-    ttl.map_or("no expiry".to_string(), |t| format!("expires in {}", fmt_ttl(u64::from(t))))
+    ttl.map_or("no expiry".to_string(), |t| {
+        format!("expires in {}", fmt_ttl(u64::from(t)))
+    })
 }
 
 fn fmt_ttl(s: u64) -> String {
@@ -320,7 +346,9 @@ fn os_err(what: &str, e: io::Error) -> String {
         Some(libc::ENOSYS) | Some(libc::EPERM) => {
             " (kernel keyrings unavailable: CONFIG_KEYS off or syscalls blocked by a sandbox)"
         }
-        Some(libc::EDQUOT) => " (key quota exceeded; see /proc/key-users and /proc/sys/kernel/keys/)",
+        Some(libc::EDQUOT) => {
+            " (key quota exceeded; see /proc/key-users and /proc/sys/kernel/keys/)"
+        }
         Some(libc::EKEYEXPIRED) => " (key expired)",
         _ => "",
     };
@@ -328,7 +356,12 @@ fn os_err(what: &str, e: io::Error) -> String {
 }
 
 fn check_set(name: &str) -> Res<()> {
-    if !name.is_empty() && !name.starts_with('.') && name.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c)) {
+    if !name.is_empty()
+        && !name.starts_with('.')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
+    {
         Ok(())
     } else {
         Err(format!("invalid keyset name {name:?}"))
@@ -342,23 +375,31 @@ fn key_desc(set: &str, generation: &vault::Generation) -> String {
 /// Revoke and unlink encryption keys in the scope whose description starts with `prefix`,
 /// except the one described by `keep`.
 fn drop_keys(scope: &Scope, prefix: &str, keep: Option<&str>) {
-    let Ok(ids) = sys::list_keyring(scope.root) else { return };
+    let Ok(ids) = sys::list_keyring(scope.root) else {
+        return;
+    };
     for id in ids {
-        if let Ok((kind, desc)) = sys::describe(id) {
-            if kind == "user" && desc.starts_with(prefix) && Some(desc.as_str()) != keep {
-                let _ = sys::revoke(id);
-                let _ = sys::unlink(id, scope.root);
-            }
+        if let Ok((kind, desc)) = sys::describe(id)
+            && kind == "user"
+            && desc.starts_with(prefix)
+            && Some(desc.as_str()) != keep
+        {
+            let _ = sys::revoke(id);
+            let _ = sys::unlink(id, scope.root);
         }
     }
 }
 
 fn read_stdin_keyset() -> Res<Vec<(String, Secret)>> {
     if io::stdin().is_terminal() {
-        return Err("stdin is a terminal: pipe the keyset in (e.g. `pass show env | tempkeys load`)".into());
+        return Err(
+            "stdin is a terminal: pipe the keyset in (e.g. `pass show env | tempkeys load`)".into(),
+        );
     }
     let mut raw = Vec::new();
-    io::stdin().read_to_end(&mut raw).map_err(|e| format!("reading stdin: {e}"))?;
+    io::stdin()
+        .read_to_end(&mut raw)
+        .map_err(|e| format!("reading stdin: {e}"))?;
     let raw = Secret(raw);
     let text = std::str::from_utf8(&raw.0).map_err(|_| "input is not valid UTF-8".to_string())?;
     parse::parse_keyset(text)
@@ -374,7 +415,8 @@ fn create_key(scope: &Scope, desc: &str, payload: &[u8], ttl: Option<u32>) -> Re
     let stage = sys::SESSION_KEYRING;
     let staged = scope.root != stage;
     let ring = if staged { stage } else { scope.root };
-    let id = sys::add_user_key(desc, payload, ring).map_err(|e| os_err("storing encryption key", e))?;
+    let id =
+        sys::add_user_key(desc, payload, ring).map_err(|e| os_err("storing encryption key", e))?;
     let finish = || -> Res<()> {
         if let Some(ttl) = ttl {
             sys::set_timeout(id, ttl).map_err(|e| os_err("setting key timeout", e))?;
@@ -396,8 +438,20 @@ fn create_key(scope: &Scope, desc: &str, payload: &[u8], ttl: Option<u32>) -> Re
 }
 
 /// Encrypt one secret into the bytes of its file.
-fn seal_file(key: &[u8], generation: &vault::Generation, expiry: u64, set: &str, name: &str, value: &Secret) -> Res<Vec<u8>> {
-    let nonce: [u8; 24] = sys::random(24).map_err(|e| os_err("random nonce", e))?.0.clone().try_into().unwrap();
+fn seal_file(
+    key: &[u8],
+    generation: &vault::Generation,
+    expiry: u64,
+    set: &str,
+    name: &str,
+    value: &Secret,
+) -> Res<Vec<u8>> {
+    let nonce: [u8; 24] = sys::random(24)
+        .map_err(|e| os_err("random nonce", e))?
+        .0
+        .clone()
+        .try_into()
+        .unwrap();
     vault::encrypt(key, generation, expiry, set, name, &value.0, &nonce)
 }
 
@@ -443,7 +497,9 @@ fn existing_header(scope: &Scope, set: &str) -> Res<Option<vault::Header>> {
     key_names(&dir)
         .ok()
         .and_then(|names| names.into_iter().next())
-        .map(|first| fs::read(dir.join(format!("{first}{EXT}"))).map_err(|e| format!("reading keyset: {e}")))
+        .map(|first| {
+            fs::read(dir.join(format!("{first}{EXT}"))).map_err(|e| format!("reading keyset: {e}"))
+        })
         .transpose()?
         .map(|f| vault::parse_header(&f))
         .transpose()
@@ -455,26 +511,47 @@ fn locked(set: &str) -> String {
 
 /// Add or replace `entries` in an existing keyset, keeping its other keys, its
 /// encryption key and its expiry. Returns the number of keys the keyset now has.
-fn merge_keyset(scope: &Scope, set: &str, header: &vault::Header, entries: &[(String, Secret)]) -> Res<usize> {
+fn merge_keyset(
+    scope: &Scope,
+    set: &str,
+    header: &vault::Header,
+    entries: &[(String, Secret)],
+) -> Res<usize> {
     let enc_key = find_key(scope, set, &header.generation)?.ok_or_else(|| locked(set))?;
     let dir = scope.dir.join(set);
     let mut files = Vec::new();
     // Untouched keys are carried over byte for byte: same key, same associated data.
     for name in key_names(&dir).map_err(|e| format!("reading keyset: {e}"))? {
         if !entries.iter().any(|(n, _)| *n == name) {
-            let bytes = fs::read(dir.join(format!("{name}{EXT}"))).map_err(|e| format!("reading {name}: {e}"))?;
+            let bytes = fs::read(dir.join(format!("{name}{EXT}")))
+                .map_err(|e| format!("reading {name}: {e}"))?;
             files.push((name, bytes));
         }
     }
     for (name, value) in entries {
-        files.push((name.clone(), seal_file(&enc_key.0, &header.generation, header.expiry, set, name, value)?));
+        files.push((
+            name.clone(),
+            seal_file(
+                &enc_key.0,
+                &header.generation,
+                header.expiry,
+                set,
+                name,
+                value,
+            )?,
+        ));
     }
     install_dir(scope, set, &files)?;
     Ok(files.len())
 }
 
 /// Replace `set` in `scope` with `entries`, encrypted under a fresh key.
-fn store_keyset(scope: &Scope, set: &str, ttl: Option<u32>, entries: &[(String, Secret)]) -> Res<()> {
+fn store_keyset(
+    scope: &Scope,
+    set: &str,
+    ttl: Option<u32>,
+    entries: &[(String, Secret)],
+) -> Res<()> {
     check_set(set)?;
     let key = sys::random(vault::KEY_LEN).map_err(|e| os_err("random key", e))?;
     let generation: vault::Generation = sys::random(vault::GEN_LEN)
@@ -492,7 +569,10 @@ fn store_keyset(scope: &Scope, set: &str, ttl: Option<u32>, entries: &[(String, 
     let built = || -> Res<()> {
         let mut files = Vec::with_capacity(entries.len());
         for (name, value) in entries {
-            files.push((name.clone(), seal_file(&key.0, &generation, expiry, set, name, value)?));
+            files.push((
+                name.clone(),
+                seal_file(&key.0, &generation, expiry, set, name, value)?,
+            ));
         }
         install_dir(scope, set, &files)
     };
@@ -530,14 +610,14 @@ fn read_value(key: &str, raw: bool) -> Res<Secret> {
         read.map_err(|e| format!("reading value: {e}"))?;
         buf = Secret(std::mem::take(&mut line).into_bytes());
     } else {
-        io::stdin().read_to_end(&mut buf.0).map_err(|e| format!("reading stdin: {e}"))?;
+        io::stdin()
+            .read_to_end(&mut buf.0)
+            .map_err(|e| format!("reading stdin: {e}"))?;
     }
-    if !raw {
-        if buf.0.last() == Some(&b'\n') {
+    if !raw && buf.0.last() == Some(&b'\n') {
+        buf.0.pop();
+        if buf.0.last() == Some(&b'\r') {
             buf.0.pop();
-            if buf.0.last() == Some(&b'\r') {
-                buf.0.pop();
-            }
         }
     }
     if buf.0.is_empty() {
@@ -549,7 +629,9 @@ fn read_value(key: &str, raw: bool) -> Res<Secret> {
 fn set_key(scope: &Scope, set: &str, ttl: Option<u32>, key: &str, raw: bool) -> Res<()> {
     check_set(set)?;
     if !parse::valid_name(key) {
-        return Err(format!("invalid key name {key:?} (use letters, digits, underscore)"));
+        return Err(format!(
+            "invalid key name {key:?} (use letters, digits, underscore)"
+        ));
     }
     let dir = scope.dir.join(set);
     let existing = existing_header(scope, set)?;
@@ -561,10 +643,19 @@ fn set_key(scope: &Scope, set: &str, ttl: Option<u32>, key: &str, raw: bool) -> 
         return Ok(());
     };
     if ttl.is_some() {
-        return Err(format!("keyset {set:?} already exists; --ttl applies only to a new keyset (use `load` to change expiry)"));
+        return Err(format!(
+            "keyset {set:?} already exists; --ttl applies only to a new keyset (use `load` to change expiry)"
+        ));
     }
     let enc_key = find_key(scope, set, &header.generation)?.ok_or_else(|| locked(set))?;
-    let file = seal_file(&enc_key.0, &header.generation, header.expiry, set, key, &value)?;
+    let file = seal_file(
+        &enc_key.0,
+        &header.generation,
+        header.expiry,
+        set,
+        key,
+        &value,
+    )?;
 
     // Write beside the target and rename over it, so readers see the old or new file, never a partial one.
     let tmp = dir.join(format!(".{key}.tmp-{}", std::process::id()));
@@ -587,20 +678,22 @@ fn set_key(scope: &Scope, set: &str, ttl: Option<u32>, key: &str, raw: bool) -> 
 fn load(scope: &Scope, set: &str, ttl: Option<u32>, merge: bool) -> Res<()> {
     check_set(set)?;
     let entries = read_stdin_keyset()?;
-    if merge {
-        if let Some(header) = existing_header(scope, set)? {
-            if ttl.is_some() {
-                return Err(format!(
-                    "keyset {set:?} already exists; --ttl applies only to a new keyset (load without --merge to change expiry)"
-                ));
-            }
-            let total = merge_keyset(scope, set, &header, &entries)?;
-            eprintln!("merged {} keys into {set:?} ({total} total)", entries.len());
-            return Ok(());
+    if merge && let Some(header) = existing_header(scope, set)? {
+        if ttl.is_some() {
+            return Err(format!(
+                "keyset {set:?} already exists; --ttl applies only to a new keyset (load without --merge to change expiry)"
+            ));
         }
+        let total = merge_keyset(scope, set, &header, &entries)?;
+        eprintln!("merged {} keys into {set:?} ({total} total)", entries.len());
+        return Ok(());
     }
     store_keyset(scope, set, ttl, &entries)?;
-    eprintln!("loaded {} keys into {set:?}, {}", entries.len(), fmt_expiry(ttl));
+    eprintln!(
+        "loaded {} keys into {set:?}, {}",
+        entries.len(),
+        fmt_expiry(ttl)
+    );
     Ok(())
 }
 
@@ -608,7 +701,11 @@ fn load(scope: &Scope, set: &str, ttl: Option<u32>, merge: bool) -> Res<()> {
 fn key_names(dir: &Path) -> io::Result<Vec<String>> {
     let mut names = Vec::new();
     for entry in fs::read_dir(dir)? {
-        if let Some(name) = entry?.file_name().to_str().and_then(|n| n.strip_suffix(EXT)) {
+        if let Some(name) = entry?
+            .file_name()
+            .to_str()
+            .and_then(|n| n.strip_suffix(EXT))
+        {
             names.push(name.to_string());
         }
     }
@@ -618,8 +715,12 @@ fn key_names(dir: &Path) -> io::Result<Vec<String>> {
 
 /// The encryption key for a file's generation, or None if it is gone.
 fn find_key(scope: &Scope, set: &str, generation: &vault::Generation) -> Res<Option<Secret>> {
-    match sys::search(scope.root, "user", &key_desc(set, generation)).map_err(|e| os_err("searching keyring", e))? {
-        Some(id) => Ok(Some(sys::read(id).map_err(|e| os_err("reading encryption key", e))?)),
+    match sys::search(scope.root, "user", &key_desc(set, generation))
+        .map_err(|e| os_err("searching keyring", e))?
+    {
+        Some(id) => Ok(Some(
+            sys::read(id).map_err(|e| os_err("reading encryption key", e))?,
+        )),
         None => Ok(None),
     }
 }
@@ -631,19 +732,24 @@ fn read_secret(scope: &Scope, set: &str, name: &str) -> Res<Secret> {
     }
     let dir = scope.dir.join(set);
     if !dir.is_dir() {
-        return Err(format!("no keyset {set:?} (never loaded, expired, or cleared)"));
+        return Err(format!(
+            "no keyset {set:?} (never loaded, expired, or cleared)"
+        ));
     }
     let file = match fs::read(dir.join(format!("{name}{EXT}"))) {
         Ok(f) => f,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(format!("no key {name:?} in keyset {set:?}")),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            return Err(format!("no key {name:?} in keyset {set:?}"));
+        }
         Err(e) => return Err(format!("reading secret file: {e}")),
     };
     let header = vault::parse_header(&file)?;
     if header.expiry <= now() {
         return Err(format!("keyset {set:?} has expired"));
     }
-    let key = find_key(scope, set, &header.generation)?
-        .ok_or_else(|| format!("keyset {set:?} is locked: its encryption key expired or was cleared"))?;
+    let key = find_key(scope, set, &header.generation)?.ok_or_else(|| {
+        format!("keyset {set:?} is locked: its encryption key expired or was cleared")
+    })?;
     vault::decrypt(&key.0, &file, set, name)
 }
 
@@ -688,12 +794,18 @@ fn list(scopes: &[Scope], set: Option<&str>) -> Res<()> {
                 .and_then(|f| vault::parse_header(&f).ok())
                 .map(|h| match find_key(scope, &name, &h.generation) {
                     Ok(Some(_)) if h.expiry == NEVER => "no expiry".to_string(),
-                    Ok(Some(_)) => format!("expires in {}", fmt_left(h.expiry.saturating_sub(now()))),
+                    Ok(Some(_)) => {
+                        format!("expires in {}", fmt_left(h.expiry.saturating_sub(now())))
+                    }
                     _ => "locked".to_string(),
                 })
                 .unwrap_or_default();
             // With more than one scope in play, say which each keyset is in.
-            let prefix = if scopes.len() > 1 { format!("{}\t", scope.label) } else { String::new() };
+            let prefix = if scopes.len() > 1 {
+                format!("{}\t", scope.label)
+            } else {
+                String::new()
+            };
             println!("{prefix}{name}\t{} keys\t{state}", names.len());
         }
     }
@@ -717,7 +829,9 @@ fn run(scopes: &[Scope], set: &str, env: &[String], quiet: bool, command: &[Stri
         let names = key_names(&scope.dir.join(set)).map_err(|_| format!("no keyset {set:?}"))?;
         names.into_iter().map(|n| (n.clone(), n)).collect()
     } else {
-        env.iter().map(|spec| parse_mapping(spec)).collect::<Res<Vec<_>>>()?
+        env.iter()
+            .map(|spec| parse_mapping(spec))
+            .collect::<Res<Vec<_>>>()?
     };
     mappings.sort();
     if let Some(w) = mappings.windows(2).find(|w| w[0].0 == w[1].0) {
@@ -730,17 +844,29 @@ fn run(scopes: &[Scope], set: &str, env: &[String], quiet: bool, command: &[Stri
     for (var, key) in &mappings {
         let value = read_secret(scope, set, key)?;
         if value.0.contains(&0) {
-            return Err(format!("key {key} contains a NUL byte and can't be an environment variable (use `get`)"));
+            return Err(format!(
+                "key {key} contains a NUL byte and can't be an environment variable (use `get`)"
+            ));
         }
         cmd.env(var, OsStr::from_bytes(&value.0));
     }
     if !quiet {
         let list: Vec<String> = mappings
             .iter()
-            .map(|(var, key)| if var == key { var.clone() } else { format!("{var}={key}") })
+            .map(|(var, key)| {
+                if var == key {
+                    var.clone()
+                } else {
+                    format!("{var}={key}")
+                }
+            })
             .collect();
         // Inside a session a keyset can come from either scope, so say which.
-        let from = if scopes.len() > 1 { format!(" (from {} keyset {set:?})", scope.label) } else { String::new() };
+        let from = if scopes.len() > 1 {
+            format!(" (from {} keyset {set:?})", scope.label)
+        } else {
+            String::new()
+        };
         eprintln!("tempkeys: populating {}{from}", list.join(" "));
     }
     let err = cmd.exec();
@@ -836,22 +962,34 @@ fn session(set: &str, ttl: Option<u32>, command: &[String]) -> Res<()> {
         return Err("stdin is piped into the keyset, so a COMMAND is required".into());
     }
     // Parse before joining so bad input fails without side effects.
-    let entries = if piped { Some(read_stdin_keyset()?) } else { None };
+    let entries = if piped {
+        Some(read_stdin_keyset()?)
+    } else {
+        None
+    };
 
-    let ring = sys::join_fresh_session_keyring().map_err(|e| os_err("joining session keyring", e))?;
+    let ring =
+        sys::join_fresh_session_keyring().map_err(|e| os_err("joining session keyring", e))?;
     // Drop the default owner/group/other grants before any key goes in.
-    sys::set_perm(ring, sys::PERM_POSSESSOR_ALL).map_err(|e| os_err("restricting session keyring", e))?;
-    let marker = sys::add_user_key(SESSION_MARKER, b"1", ring).map_err(|e| os_err("marking session", e))?;
+    sys::set_perm(ring, sys::PERM_POSSESSOR_ALL)
+        .map_err(|e| os_err("restricting session keyring", e))?;
+    let marker =
+        sys::add_user_key(SESSION_MARKER, b"1", ring).map_err(|e| os_err("marking session", e))?;
     sys::set_perm(marker, sys::PERM_POSSESSOR_READ).map_err(|e| os_err("marking session", e))?;
 
     let scope = Scope::session()?;
     prune(std::slice::from_ref(&scope));
     if let Some(entries) = &entries {
         store_keyset(&scope, set, ttl, entries)?;
-        eprintln!("loaded {} keys into session keyset {set:?}, {}", entries.len(), fmt_expiry(ttl));
+        eprintln!(
+            "loaded {} keys into session keyset {set:?}, {}",
+            entries.len(),
+            fmt_expiry(ttl)
+        );
     }
     // Members may add and remove keys but never change permissions.
-    sys::set_perm(ring, sys::PERM_POSSESSOR_NO_SETATTR).map_err(|e| os_err("restricting session keyring", e))?;
+    sys::set_perm(ring, sys::PERM_POSSESSOR_NO_SETATTR)
+        .map_err(|e| os_err("restricting session keyring", e))?;
 
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
     let argv: Vec<&str> = if command.is_empty() {
@@ -889,7 +1027,12 @@ fn main() -> ExitCode {
             match read {
                 Cmd::Get { set, key } => get(&pick(&scopes, &set.set)?, &set.set, key),
                 Cmd::List { set } => list(&scopes, set.as_deref()),
-                Cmd::Run { set, env, quiet, command } => run(&scopes, &set.set, env, *quiet, command),
+                Cmd::Run {
+                    set,
+                    env,
+                    quiet,
+                    command,
+                } => run(&scopes, &set.set, env, *quiet, command),
                 _ => unreachable!(),
             }
         }),

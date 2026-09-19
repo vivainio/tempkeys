@@ -65,10 +65,21 @@ fn cstr(s: &str) -> io::Result<CString> {
 fn add(kind: &str, desc: &str, payload: &[u8], ring: KeyId) -> io::Result<KeyId> {
     let kind = cstr(kind)?;
     let desc = cstr(desc)?;
-    let ptr = if payload.is_empty() { std::ptr::null() } else { payload.as_ptr() };
+    let ptr = if payload.is_empty() {
+        std::ptr::null()
+    } else {
+        payload.as_ptr()
+    };
     // SAFETY: pointers are valid for the given lengths for the call's duration.
     let id = check(unsafe {
-        libc::syscall(libc::SYS_add_key, kind.as_ptr(), desc.as_ptr(), ptr, payload.len(), ring)
+        libc::syscall(
+            libc::SYS_add_key,
+            kind.as_ptr(),
+            desc.as_ptr(),
+            ptr,
+            payload.len(),
+            ring,
+        )
     })?;
     Ok(id as KeyId)
 }
@@ -87,7 +98,14 @@ pub fn set_perm(id: KeyId, perm: u32) -> io::Result<()> {
 /// Make the key or keyring expire after `secs` seconds.
 pub fn set_timeout(id: KeyId, secs: u32) -> io::Result<()> {
     // SAFETY: plain integer arguments.
-    check(unsafe { libc::syscall(libc::SYS_keyctl, KEYCTL_SET_TIMEOUT, id, secs as libc::c_ulong) })?;
+    check(unsafe {
+        libc::syscall(
+            libc::SYS_keyctl,
+            KEYCTL_SET_TIMEOUT,
+            id,
+            secs as libc::c_ulong,
+        )
+    })?;
     Ok(())
 }
 
@@ -116,7 +134,14 @@ pub fn search(ring: KeyId, kind: &str, desc: &str) -> io::Result<Option<KeyId>> 
     let desc = cstr(desc)?;
     // SAFETY: both pointers are NUL-terminated and outlive the call.
     let ret = unsafe {
-        libc::syscall(libc::SYS_keyctl, KEYCTL_SEARCH, ring, kind.as_ptr(), desc.as_ptr(), 0)
+        libc::syscall(
+            libc::SYS_keyctl,
+            KEYCTL_SEARCH,
+            ring,
+            kind.as_ptr(),
+            desc.as_ptr(),
+            0,
+        )
     };
     if ret >= 0 {
         return Ok(Some(ret as KeyId));
@@ -134,7 +159,13 @@ pub fn read(id: KeyId) -> io::Result<Secret> {
     loop {
         // SAFETY: `buf` is valid for `len` writable bytes.
         let need = check(unsafe {
-            libc::syscall(libc::SYS_keyctl, KEYCTL_READ, id, buf.0.as_mut_ptr(), buf.0.len())
+            libc::syscall(
+                libc::SYS_keyctl,
+                KEYCTL_READ,
+                id,
+                buf.0.as_mut_ptr(),
+                buf.0.len(),
+            )
         })? as usize;
         if need <= buf.0.len() {
             buf.0.truncate(need);
@@ -160,7 +191,13 @@ pub fn describe(id: KeyId) -> io::Result<(String, String)> {
     loop {
         // SAFETY: `buf` is valid for `len` writable bytes.
         let need = check(unsafe {
-            libc::syscall(libc::SYS_keyctl, KEYCTL_DESCRIBE, id, buf.as_mut_ptr(), buf.len())
+            libc::syscall(
+                libc::SYS_keyctl,
+                KEYCTL_DESCRIBE,
+                id,
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
         })? as usize;
         if need <= buf.len() {
             buf.truncate(need);
@@ -183,7 +220,11 @@ pub fn describe(id: KeyId) -> io::Result<(String, String)> {
 pub fn join_fresh_session_keyring() -> io::Result<KeyId> {
     // SAFETY: a NULL name requests a new anonymous keyring.
     let id = check(unsafe {
-        libc::syscall(libc::SYS_keyctl, KEYCTL_JOIN_SESSION_KEYRING, std::ptr::null::<libc::c_char>())
+        libc::syscall(
+            libc::SYS_keyctl,
+            KEYCTL_JOIN_SESSION_KEYRING,
+            std::ptr::null::<libc::c_char>(),
+        )
     })?;
     Ok(id as KeyId)
 }
