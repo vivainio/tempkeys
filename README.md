@@ -39,7 +39,7 @@ $ cargo install --git https://github.com/vivainio/ziiring
 
 | Command | What it does |
 | --- | --- |
-| `load [--set NAME] [--ttl DUR]` | Replace a keyset with the full set read from stdin |
+| `load [--set NAME] [--ttl DUR] [--merge]` | Replace a keyset with the full set read from stdin, or add to it with `--merge` |
 | `set [--set NAME] [--ttl DUR] [--raw] KEY` | Add or replace one key, value from stdin |
 | `get [--set NAME] KEY` | Decrypt and print one key's raw value |
 | `list [--set NAME]` | List keysets, or key names in one (never values) |
@@ -50,7 +50,11 @@ $ cargo install --git https://github.com/vivainio/ziiring
 `load` reads dotenv lines (`KEY=VALUE`, `#` comments, optional `export`, one
 pair of surrounding quotes stripped) or a JSON object of strings. Key names must
 be valid environment variable names. Loading is all-or-nothing, and replaces the
-whole keyset: keys missing from the new input are gone. Secrets are only ever
+whole keyset: keys missing from the new input are gone. With `--merge` the input
+is added to the existing keyset instead: keys in the input are added or
+replaced, and every other key stays. A merge keeps the keyset's encryption key
+and expiry, so `--ttl` is rejected for an existing keyset; if the keyset doesn't
+exist yet, `--merge` behaves like a normal load. Secrets are only ever
 read from stdin, never from arguments. Empty values are rejected.
 
 `run` lists the variables it populates on stderr (names only, never values):
@@ -97,7 +101,7 @@ files, but it is authenticated: the associated data is the header plus the
 keyset and key names. A file can't be swapped with another key's file, moved to
 another keyset, or have its expiry extended without decryption failing.
 
-**Loading.** Each `load` generates a fresh random key, stores it in the kernel
+**Loading.** Each `load` (without `--merge`) generates a fresh random key, stores it in the kernel
 keyring, writes the new files to a temporary directory, and swaps that directory
 in, so readers never see a half-written keyset. Older keys for that keyset are
 then revoked. Bad input leaves the current keyset untouched.

@@ -69,12 +69,18 @@ enum Cmd {
     ///
     /// Accepts dotenv lines (KEY=VALUE) or a JSON object of strings. The load is
     /// all-or-nothing: bad input leaves the current keyset untouched. Every load
-    /// uses a new encryption key.
+    /// uses a new encryption key, unless --merge is given.
     Load {
         #[command(flatten)]
         set: SetArg,
         #[command(flatten)]
         ttl: TtlArg,
+        /// Add or replace the given keys and keep the rest of an existing keyset
+        ///
+        /// The keyset keeps its encryption key and expiry (so --ttl is rejected for
+        /// an existing keyset). If the keyset doesn't exist this is a normal load.
+        #[arg(long)]
+        merge: bool,
     },
     /// Add or replace one key, reading its value from stdin.
     ///
@@ -389,6 +395,84 @@ fn create_key(scope: &Scope, desc: &str, payload: &[u8], ttl: Option<u32>) -> Re
     Ok(id)
 }
 
+/// Encrypt one secret into the bytes of its file.
+fn seal_file(key: &[u8], generation: &vault::Generation, expiry: u64, set: &str, name: &str, value: &Secret) -> Res<Vec<u8>> {
+    let nonce: [u8; 24] = sys::random(24).map_err(|e| os_err("random nonce", e))?.0.clone().try_into().unwrap();
+    vault::encrypt(key, generation, expiry, set, name, &value.0, &nonce)
+}
+
+/// Make `files` (key name, file bytes) the whole contents of keyset `set`.
+/// They go into a temporary directory that is swapped in, so readers never see
+/// a half-written keyset.
+fn install_dir(scope: &Scope, set: &str, files: &[(String, Vec<u8>)]) -> Res<()> {
+    mkdir_private(&scope.dir)?;
+    let tmp = scope.dir.join(format!(".{set}.new-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&tmp);
+    let install = || -> Res<()> {
+        mkdir_private(&tmp)?;
+        for (name, bytes) in files {
+            let path = tmp.join(format!("{name}{EXT}"));
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)
+                .and_then(|mut f| f.write_all(bytes))
+                .map_err(|e| format!("writing {}: {e}", path.display()))?;
+        }
+        let dest = scope.dir.join(set);
+        let old = scope.dir.join(format!(".{set}.old-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&old);
+        if dest.exists() {
+            fs::rename(&dest, &old).map_err(|e| format!("replacing keyset: {e}"))?;
+        }
+        fs::rename(&tmp, &dest).map_err(|e| format!("installing keyset: {e}"))?;
+        let _ = fs::remove_dir_all(&old);
+        Ok(())
+    };
+    let result = install();
+    if result.is_err() {
+        let _ = fs::remove_dir_all(&tmp);
+    }
+    result
+}
+
+/// The header (key generation and expiry) shared by an existing keyset's files.
+fn existing_header(scope: &Scope, set: &str) -> Res<Option<vault::Header>> {
+    let dir = scope.dir.join(set);
+    key_names(&dir)
+        .ok()
+        .and_then(|names| names.into_iter().next())
+        .map(|first| fs::read(dir.join(format!("{first}{EXT}"))).map_err(|e| format!("reading keyset: {e}")))
+        .transpose()?
+        .map(|f| vault::parse_header(&f))
+        .transpose()
+}
+
+fn locked(set: &str) -> String {
+    format!("keyset {set:?} is locked: its encryption key expired or was cleared")
+}
+
+/// Add or replace `entries` in an existing keyset, keeping its other keys, its
+/// encryption key and its expiry. Returns the number of keys the keyset now has.
+fn merge_keyset(scope: &Scope, set: &str, header: &vault::Header, entries: &[(String, Secret)]) -> Res<usize> {
+    let enc_key = find_key(scope, set, &header.generation)?.ok_or_else(|| locked(set))?;
+    let dir = scope.dir.join(set);
+    let mut files = Vec::new();
+    // Untouched keys are carried over byte for byte: same key, same associated data.
+    for name in key_names(&dir).map_err(|e| format!("reading keyset: {e}"))? {
+        if !entries.iter().any(|(n, _)| *n == name) {
+            let bytes = fs::read(dir.join(format!("{name}{EXT}"))).map_err(|e| format!("reading {name}: {e}"))?;
+            files.push((name, bytes));
+        }
+    }
+    for (name, value) in entries {
+        files.push((name.clone(), seal_file(&enc_key.0, &header.generation, header.expiry, set, name, value)?));
+    }
+    install_dir(scope, set, &files)?;
+    Ok(files.len())
+}
+
 /// Replace `set` in `scope` with `entries`, encrypted under a fresh key.
 fn store_keyset(scope: &Scope, set: &str, ttl: Option<u32>, entries: &[(String, Secret)]) -> Res<()> {
     check_set(set)?;
@@ -405,36 +489,14 @@ fn store_keyset(scope: &Scope, set: &str, ttl: Option<u32>, entries: &[(String, 
     let desc = key_desc(set, &generation);
     create_key(scope, &desc, &key.0, ttl)?;
 
-    mkdir_private(&scope.dir)?;
-    let tmp = scope.dir.join(format!(".{set}.new-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&tmp);
-    let write_all = || -> Res<()> {
-        mkdir_private(&tmp)?;
+    let built = || -> Res<()> {
+        let mut files = Vec::with_capacity(entries.len());
         for (name, value) in entries {
-            let nonce: [u8; 24] = sys::random(24).map_err(|e| os_err("random nonce", e))?.0.clone().try_into().unwrap();
-            let file = vault::encrypt(&key.0, &generation, expiry, set, name, &value.0, &nonce)?;
-            let path = tmp.join(format!("{name}{EXT}"));
-            fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&path)
-                .and_then(|mut f| f.write_all(&file))
-                .map_err(|e| format!("writing {}: {e}", path.display()))?;
+            files.push((name.clone(), seal_file(&key.0, &generation, expiry, set, name, value)?));
         }
-        // Swap the whole directory in; readers never see a half-written keyset.
-        let dest = scope.dir.join(set);
-        let old = scope.dir.join(format!(".{set}.old-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&old);
-        if dest.exists() {
-            fs::rename(&dest, &old).map_err(|e| format!("replacing keyset: {e}"))?;
-        }
-        fs::rename(&tmp, &dest).map_err(|e| format!("installing keyset: {e}"))?;
-        let _ = fs::remove_dir_all(&old);
-        Ok(())
+        install_dir(scope, set, &files)
     };
-    if let Err(e) = write_all() {
-        let _ = fs::remove_dir_all(&tmp);
+    if let Err(e) = built() {
         drop_keys(scope, &desc, None);
         return Err(e);
     }
@@ -490,13 +552,7 @@ fn set_key(scope: &Scope, set: &str, ttl: Option<u32>, key: &str, raw: bool) -> 
         return Err(format!("invalid key name {key:?} (use letters, digits, underscore)"));
     }
     let dir = scope.dir.join(set);
-    let existing = key_names(&dir)
-        .ok()
-        .and_then(|names| names.into_iter().next())
-        .map(|first| fs::read(dir.join(format!("{first}{EXT}"))).map_err(|e| format!("reading keyset: {e}")))
-        .transpose()?
-        .map(|f| vault::parse_header(&f))
-        .transpose()?;
+    let existing = existing_header(scope, set)?;
     let value = read_value(key, raw)?;
 
     let Some(header) = existing else {
@@ -507,10 +563,8 @@ fn set_key(scope: &Scope, set: &str, ttl: Option<u32>, key: &str, raw: bool) -> 
     if ttl.is_some() {
         return Err(format!("keyset {set:?} already exists; --ttl applies only to a new keyset (use `load` to change expiry)"));
     }
-    let enc_key = find_key(scope, set, &header.generation)?
-        .ok_or_else(|| format!("keyset {set:?} is locked: its encryption key expired or was cleared"))?;
-    let nonce: [u8; 24] = sys::random(24).map_err(|e| os_err("random nonce", e))?.0.clone().try_into().unwrap();
-    let file = vault::encrypt(&enc_key.0, &header.generation, header.expiry, set, key, &value.0, &nonce)?;
+    let enc_key = find_key(scope, set, &header.generation)?.ok_or_else(|| locked(set))?;
+    let file = seal_file(&enc_key.0, &header.generation, header.expiry, set, key, &value)?;
 
     // Write beside the target and rename over it, so readers see the old or new file, never a partial one.
     let tmp = dir.join(format!(".{key}.tmp-{}", std::process::id()));
@@ -530,8 +584,21 @@ fn set_key(scope: &Scope, set: &str, ttl: Option<u32>, key: &str, raw: bool) -> 
     Ok(())
 }
 
-fn load(scope: &Scope, set: &str, ttl: Option<u32>) -> Res<()> {
+fn load(scope: &Scope, set: &str, ttl: Option<u32>, merge: bool) -> Res<()> {
+    check_set(set)?;
     let entries = read_stdin_keyset()?;
+    if merge {
+        if let Some(header) = existing_header(scope, set)? {
+            if ttl.is_some() {
+                return Err(format!(
+                    "keyset {set:?} already exists; --ttl applies only to a new keyset (load without --merge to change expiry)"
+                ));
+            }
+            let total = merge_keyset(scope, set, &header, &entries)?;
+            eprintln!("merged {} keys into {set:?} ({total} total)", entries.len());
+            return Ok(());
+        }
+    }
     store_keyset(scope, set, ttl, &entries)?;
     eprintln!("loaded {} keys into {set:?}, {}", entries.len(), fmt_expiry(ttl));
     Ok(())
@@ -805,9 +872,9 @@ fn main() -> ExitCode {
     };
     let result = match &cli.command {
         Cmd::Session { set, ttl, command } => session(&set.set, ttl.ttl, command),
-        Cmd::Load { set, ttl } => Scope::for_write(target).and_then(|s| {
+        Cmd::Load { set, ttl, merge } => Scope::for_write(target).and_then(|s| {
             prune(std::slice::from_ref(&s));
-            load(&s, &set.set, ttl.ttl)
+            load(&s, &set.set, ttl.ttl, *merge)
         }),
         Cmd::Set { set, ttl, raw, key } => Scope::for_write(target).and_then(|s| {
             prune(std::slice::from_ref(&s));
