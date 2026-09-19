@@ -26,17 +26,24 @@ const EXT: &str = ".enc";
 /// held by the kernel, with a timeout: when it expires (or on reboot, or `clear`)
 /// the files can no longer be decrypted and are deleted.
 ///
-/// By default the key lives in your user keyring (@u), so every process running
-/// as your UID can use the keyset. With --session it lives in a private session
-/// keyring created by `ziiring session`, usable only by that process family.
-/// Root can always read either. Files go in $XDG_RUNTIME_DIR/ziiring, falling
+/// There are two scopes. The user scope keeps the key in your user keyring (@u),
+/// so every process running as your UID can use the keyset. The session scope
+/// keeps it in a private session keyring created by `ziiring session`, usable
+/// only by that process family. Outside a session everything uses the user scope.
+/// Inside one, reads (get, run, list) look in the session scope first and fall
+/// back to the user scope per keyset, while writes (load, set, clear) go to the
+/// session scope; --user and --session override this. Root can always read either. Files go in $XDG_RUNTIME_DIR/ziiring, falling
 /// back to $XDG_CACHE_HOME/ziiring (default ~/.cache/ziiring).
 #[derive(Parser)]
 #[command(version)]
 struct Cli {
-    /// Use the session keyset (inside `ziiring session`) instead of the user keyring
-    #[arg(long, global = true)]
+    /// Use only the session scope (an error outside `ziiring session`)
+    #[arg(long, global = true, conflicts_with = "user")]
     session: bool,
+
+    /// Use only the user scope, even inside a session
+    #[arg(long, global = true)]
+    user: bool,
 
     #[command(subcommand)]
     command: Cmd,
@@ -147,8 +154,19 @@ enum Cmd {
 
 type Res<T> = Result<T, String>;
 
+/// Which scope(s) a command was asked to use.
+#[derive(Clone, Copy)]
+enum Target {
+    /// Session scope first when inside a session, then user scope.
+    Auto,
+    User,
+    Session,
+}
+
 /// Where a keyset's encryption key lives, and where its files live.
+#[derive(Clone)]
 struct Scope {
+    label: &'static str,
     root: KeyId,
     perm: u32,
     dir: PathBuf,
@@ -157,24 +175,60 @@ struct Scope {
 impl Scope {
     fn user() -> Res<Scope> {
         // Owner-only: any process of this UID, no one else.
-        Ok(Scope { root: sys::USER_KEYRING, perm: sys::PERM_OWNER_ALL, dir: base_dir()?.join("user") })
+        Ok(Scope { label: "user", root: sys::USER_KEYRING, perm: sys::PERM_OWNER_ALL, dir: base_dir()?.join("user") })
     }
 
-    /// Only valid inside a session created by `ziiring session`; refusing anywhere
-    /// else avoids dropping keys into a login's shared session keyring.
-    fn session() -> Res<Scope> {
+    /// The session scope, if we are inside a session created by `ziiring session`.
+    /// Anywhere else it is refused, which avoids dropping keys into a login's
+    /// shared session keyring.
+    fn try_session() -> Res<Option<Scope>> {
         let marker = sys::search(sys::SESSION_KEYRING, "user", SESSION_MARKER)
             .map_err(|e| os_err("searching session keyring", e))?;
         if marker.is_none() {
-            return Err("not inside a ziiring session (start one with `ziiring session`)".into());
+            return Ok(None);
         }
         let serial = sys::serial(sys::SESSION_KEYRING).map_err(|e| os_err("resolving session keyring", e))?;
-        Ok(Scope {
+        Ok(Some(Scope {
+            label: "session",
             root: sys::SESSION_KEYRING,
             perm: sys::PERM_POSSESSOR_READ,
             dir: base_dir()?.join(format!("{SESSION_DIR_PREFIX}{serial}")),
+        }))
+    }
+
+    fn session() -> Res<Scope> {
+        Self::try_session()?.ok_or_else(|| "not inside a ziiring session (start one with `ziiring session`)".into())
+    }
+
+    /// The single scope a write (load, set, clear) goes to.
+    fn for_write(target: Target) -> Res<Scope> {
+        match target {
+            Target::User => Scope::user(),
+            Target::Session => Scope::session(),
+            Target::Auto => match Scope::try_session()? {
+                Some(session) => Ok(session),
+                None => Scope::user(),
+            },
+        }
+    }
+
+    /// The scopes a read (get, run, list) may use, in lookup order.
+    fn for_read(target: Target) -> Res<Vec<Scope>> {
+        Ok(match target {
+            Target::User => vec![Scope::user()?],
+            Target::Session => vec![Scope::session()?],
+            Target::Auto => Scope::try_session()?.into_iter().chain([Scope::user()?]).collect(),
         })
     }
+}
+
+/// The first scope that has keyset `set`; if none does, the first scope, so the
+/// caller reports "no such keyset". Fallback is per keyset: once a scope has the
+/// keyset it is used whole, and a key missing from it is not taken from another.
+fn pick(scopes: &[Scope], set: &str) -> Res<Scope> {
+    check_set(set)?;
+    let found = scopes.iter().find(|s| s.dir.join(set).is_dir()).or(scopes.first());
+    found.cloned().ok_or_else(|| "no scope available".to_string())
 }
 
 const SESSION_DIR_PREFIX: &str = "session-";
@@ -304,6 +358,37 @@ fn read_stdin_keyset() -> Res<Vec<(String, Secret)>> {
     parse::parse_keyset(text)
 }
 
+/// Create the encryption key in `scope`'s keyring, with its timeout and permissions.
+///
+/// Only a possessor may change a key's timeout or permissions, and a process may
+/// not possess the target keyring (it doesn't link `@u` from inside a private
+/// session). So the key is created in the session keyring, which we do possess,
+/// secured there, and then linked into place.
+fn create_key(scope: &Scope, desc: &str, payload: &[u8], ttl: Option<u32>) -> Res<KeyId> {
+    let stage = sys::SESSION_KEYRING;
+    let staged = scope.root != stage;
+    let ring = if staged { stage } else { scope.root };
+    let id = sys::add_user_key(desc, payload, ring).map_err(|e| os_err("storing encryption key", e))?;
+    let finish = || -> Res<()> {
+        if let Some(ttl) = ttl {
+            sys::set_timeout(id, ttl).map_err(|e| os_err("setting key timeout", e))?;
+        }
+        sys::set_perm(id, scope.perm).map_err(|e| os_err("restricting key", e))?;
+        if staged {
+            sys::link(id, scope.root).map_err(|e| os_err("linking key", e))?;
+            sys::unlink(id, stage).map_err(|e| os_err("unstaging key", e))?;
+        }
+        Ok(())
+    };
+    if let Err(e) = finish() {
+        let _ = sys::revoke(id);
+        let _ = sys::unlink(id, ring);
+        let _ = sys::unlink(id, scope.root);
+        return Err(e);
+    }
+    Ok(id)
+}
+
 /// Replace `set` in `scope` with `entries`, encrypted under a fresh key.
 fn store_keyset(scope: &Scope, set: &str, ttl: Option<u32>, entries: &[(String, Secret)]) -> Res<()> {
     check_set(set)?;
@@ -318,18 +403,7 @@ fn store_keyset(scope: &Scope, set: &str, ttl: Option<u32>, entries: &[(String, 
 
     // The kernel key goes in first: files are unreadable without it, never the reverse.
     let desc = key_desc(set, &generation);
-    let key_id = sys::add_user_key(&desc, &key.0, scope.root).map_err(|e| os_err("storing encryption key", e))?;
-    // Timeout and permissions need setattr, so tighten permissions last.
-    let seal = || -> Res<()> {
-        if let Some(ttl) = ttl {
-            sys::set_timeout(key_id, ttl).map_err(|e| os_err("setting key timeout", e))?;
-        }
-        sys::set_perm(key_id, scope.perm).map_err(|e| os_err("restricting key", e))
-    };
-    if let Err(e) = seal() {
-        drop_keys(scope, &desc, None);
-        return Err(e);
-    }
+    create_key(scope, &desc, &key.0, ttl)?;
 
     mkdir_private(&scope.dir)?;
     let tmp = scope.dir.join(format!(".{set}.new-{}", std::process::id()));
@@ -529,31 +603,31 @@ fn set_names(scope: &Scope) -> Vec<String> {
     sets
 }
 
-fn list(scope: &Scope, set: Option<&str>) -> Res<()> {
-    match set {
-        Some(name) => {
-            check_set(name)?;
-            let names = key_names(&scope.dir.join(name)).map_err(|_| format!("no keyset {name:?}"))?;
-            for key in names {
-                println!("{key}");
-            }
+fn list(scopes: &[Scope], set: Option<&str>) -> Res<()> {
+    if let Some(name) = set {
+        let scope = pick(scopes, name)?;
+        for key in key_names(&scope.dir.join(name)).map_err(|_| format!("no keyset {name:?}"))? {
+            println!("{key}");
         }
-        None => {
-            for name in set_names(scope) {
-                let dir = scope.dir.join(&name);
-                let names = key_names(&dir).unwrap_or_default();
-                let state = names
-                    .first()
-                    .and_then(|k| fs::read(dir.join(format!("{k}{EXT}"))).ok())
-                    .and_then(|f| vault::parse_header(&f).ok())
-                    .map(|h| match find_key(scope, &name, &h.generation) {
-                        Ok(Some(_)) if h.expiry == NEVER => "no expiry".to_string(),
-                        Ok(Some(_)) => format!("expires in {}", fmt_left(h.expiry.saturating_sub(now()))),
-                        _ => "locked".to_string(),
-                    })
-                    .unwrap_or_default();
-                println!("{name}\t{} keys\t{state}", names.len());
-            }
+        return Ok(());
+    }
+    for scope in scopes {
+        for name in set_names(scope) {
+            let dir = scope.dir.join(&name);
+            let names = key_names(&dir).unwrap_or_default();
+            let state = names
+                .first()
+                .and_then(|k| fs::read(dir.join(format!("{k}{EXT}"))).ok())
+                .and_then(|f| vault::parse_header(&f).ok())
+                .map(|h| match find_key(scope, &name, &h.generation) {
+                    Ok(Some(_)) if h.expiry == NEVER => "no expiry".to_string(),
+                    Ok(Some(_)) => format!("expires in {}", fmt_left(h.expiry.saturating_sub(now()))),
+                    _ => "locked".to_string(),
+                })
+                .unwrap_or_default();
+            // With more than one scope in play, say which each keyset is in.
+            let prefix = if scopes.len() > 1 { format!("{}\t", scope.label) } else { String::new() };
+            println!("{prefix}{name}\t{} keys\t{state}", names.len());
         }
     }
     Ok(())
@@ -570,8 +644,8 @@ fn parse_mapping(spec: &str) -> Res<(String, String)> {
     Ok((var.to_string(), key.to_string()))
 }
 
-fn run(scope: &Scope, set: &str, env: &[String], quiet: bool, command: &[String]) -> Res<()> {
-    check_set(set)?;
+fn run(scopes: &[Scope], set: &str, env: &[String], quiet: bool, command: &[String]) -> Res<()> {
+    let scope = &pick(scopes, set)?;
     let mut mappings = if env.is_empty() {
         let names = key_names(&scope.dir.join(set)).map_err(|_| format!("no keyset {set:?}"))?;
         names.into_iter().map(|n| (n.clone(), n)).collect()
@@ -598,7 +672,9 @@ fn run(scope: &Scope, set: &str, env: &[String], quiet: bool, command: &[String]
             .iter()
             .map(|(var, key)| if var == key { var.clone() } else { format!("{var}={key}") })
             .collect();
-        eprintln!("ziiring: populating {}", list.join(" "));
+        // Inside a session a keyset can come from either scope, so say which.
+        let from = if scopes.len() > 1 { format!(" (from {} keyset {set:?})", scope.label) } else { String::new() };
+        eprintln!("ziiring: populating {}{from}", list.join(" "));
     }
     let err = cmd.exec();
     Err(format!("exec {}: {err}", command[0]))
@@ -647,7 +723,8 @@ fn session_is_dead(serial: KeyId) -> bool {
 }
 
 /// Best-effort housekeeping: delete files that can never be decrypted again.
-fn prune(scope: Option<&Scope>) {
+/// `scopes` are the ones we can also check for keysets whose key is gone.
+fn prune(scopes: &[Scope]) {
     let Ok(base) = base_dir() else { return };
     let mut files = Vec::new();
     walk_files(&base, &mut files);
@@ -668,8 +745,7 @@ fn prune(scope: Option<&Scope>) {
             let _ = fs::remove_dir_all(entry.path());
         }
     }
-    // In our own scope we can also tell when a keyset's key is gone.
-    if let Some(scope) = scope {
+    for scope in scopes {
         for set in set_names(scope) {
             let dir = scope.dir.join(&set);
             for name in key_names(&dir).unwrap_or_default() {
@@ -702,7 +778,7 @@ fn session(set: &str, ttl: Option<u32>, command: &[String]) -> Res<()> {
     sys::set_perm(marker, sys::PERM_POSSESSOR_READ).map_err(|e| os_err("marking session", e))?;
 
     let scope = Scope::session()?;
-    prune(Some(&scope));
+    prune(std::slice::from_ref(&scope));
     if let Some(entries) = &entries {
         store_keyset(&scope, set, ttl, entries)?;
         eprintln!("loaded {} keys into session keyset {set:?}, {}", entries.len(), fmt_expiry(ttl));
@@ -722,23 +798,34 @@ fn session(set: &str, ttl: Option<u32>, command: &[String]) -> Res<()> {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    let target = match (cli.session, cli.user) {
+        (true, _) => Target::Session,
+        (_, true) => Target::User,
+        _ => Target::Auto,
+    };
     let result = match &cli.command {
         Cmd::Session { set, ttl, command } => session(&set.set, ttl.ttl, command),
-        cmd => {
-            let scope = if cli.session { Scope::session() } else { Scope::user() };
-            scope.and_then(|s| {
-                prune(Some(&s));
-                match cmd {
-                    Cmd::Load { set, ttl } => load(&s, &set.set, ttl.ttl),
-                    Cmd::Set { set, ttl, raw, key } => set_key(&s, &set.set, ttl.ttl, key, *raw),
-                    Cmd::Get { set, key } => get(&s, &set.set, key),
-                    Cmd::List { set } => list(&s, set.as_deref()),
-                    Cmd::Run { set, env, quiet, command } => run(&s, &set.set, env, *quiet, command),
-                    Cmd::Clear { set, all } => clear(&s, &set.set, *all),
-                    Cmd::Session { .. } => unreachable!(),
-                }
-            })
-        }
+        Cmd::Load { set, ttl } => Scope::for_write(target).and_then(|s| {
+            prune(std::slice::from_ref(&s));
+            load(&s, &set.set, ttl.ttl)
+        }),
+        Cmd::Set { set, ttl, raw, key } => Scope::for_write(target).and_then(|s| {
+            prune(std::slice::from_ref(&s));
+            set_key(&s, &set.set, ttl.ttl, key, *raw)
+        }),
+        Cmd::Clear { set, all } => Scope::for_write(target).and_then(|s| {
+            prune(std::slice::from_ref(&s));
+            clear(&s, &set.set, *all)
+        }),
+        read => Scope::for_read(target).and_then(|scopes| {
+            prune(&scopes);
+            match read {
+                Cmd::Get { set, key } => get(&pick(&scopes, &set.set)?, &set.set, key),
+                Cmd::List { set } => list(&scopes, set.as_deref()),
+                Cmd::Run { set, env, quiet, command } => run(&scopes, &set.set, env, *quiet, command),
+                _ => unreachable!(),
+            }
+        }),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

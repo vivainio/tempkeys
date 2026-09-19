@@ -118,8 +118,8 @@ private session keyring that only one process family can use:
 ```console
 $ pass show myenv | ziiring session --ttl 8h -- ./myapp
 $ ziiring session                       # a shell with an empty private session
-$ ziiring --session load                #   ...load into it from inside
-$ ziiring --session get API_TOKEN       #   ...and read it back
+$ ziiring load                          #   ...load into the session, not @u
+$ ziiring get API_TOKEN                 #   ...and read it back
 ```
 
 `session` joins a fresh anonymous session keyring, gives it possessor-only
@@ -127,10 +127,28 @@ permissions before any key goes in, and `exec`s the command, which inherits it.
 If stdin is piped, the keyset is read from it and loaded with its key in the
 session keyring; nothing touches `@u`, and a command is then required because
 stdin is used up. Session members can add and remove keys but can't change
-permissions. `--session` works only inside a session that ziiring created, so
-secrets can't land in your login's shared session keyring by mistake.
+permissions. The session scope exists only inside a session that ziiring
+created, so secrets can't land in your login's shared session keyring by mistake.
 
 The keyset lasts as long as the process family, or the TTL, whichever ends first.
+
+### Which scope does a command use?
+
+Outside a session everything uses the user scope. Inside one:
+
+| Commands | Default | Override |
+| --- | --- | --- |
+| `get`, `run`, `list -s NAME` | the session scope first, then the user scope | `--session` or `--user` restricts to one |
+| `load`, `set`, `clear` | the session scope only | `--user` writes to the user scope |
+| `list` | both scopes, labelled | `--session` or `--user` restricts to one |
+
+The fallback is **per keyset**: if the session scope has a keyset called
+`default`, that keyset is used whole, and a key missing from it is an error
+rather than being taken from the user scope's `default`. `run` says where its
+values came from, for example `populating GH_TOKEN=github_token (from session
+keyset "default")`, so a fallback can't go unnoticed. Files for the two scopes
+live in separate directories and their keys in separate keyrings, so the same
+keyset name in both never mixes.
 
 ## What this does and doesn't protect against
 

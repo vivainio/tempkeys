@@ -31,6 +31,7 @@ const KEYCTL_JOIN_SESSION_KEYRING: libc::c_long = 1;
 const KEYCTL_REVOKE: libc::c_long = 3;
 const KEYCTL_SETPERM: libc::c_long = 5;
 const KEYCTL_DESCRIBE: libc::c_long = 6;
+const KEYCTL_LINK: libc::c_long = 8;
 const KEYCTL_UNLINK: libc::c_long = 9;
 const KEYCTL_SEARCH: libc::c_long = 10;
 const KEYCTL_READ: libc::c_long = 11;
@@ -93,6 +94,12 @@ pub fn set_timeout(id: KeyId, secs: u32) -> io::Result<()> {
 pub fn revoke(id: KeyId) -> io::Result<()> {
     // SAFETY: plain integer arguments.
     check(unsafe { libc::syscall(libc::SYS_keyctl, KEYCTL_REVOKE, id) })?;
+    Ok(())
+}
+
+pub fn link(id: KeyId, ring: KeyId) -> io::Result<()> {
+    // SAFETY: plain integer arguments.
+    check(unsafe { libc::syscall(libc::SYS_keyctl, KEYCTL_LINK, id, ring) })?;
     Ok(())
 }
 
