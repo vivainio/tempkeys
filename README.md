@@ -83,8 +83,13 @@ family exits.
 kernel @u:  ziiring:key:default:<generation>   32-byte key (optional timeout)
 ```
 
-`<dir>` is `$ZIIRING_DIR`, else `$XDG_RUNTIME_DIR/ziiring`, else
-`~/.cache/ziiring`. Files are mode `0600` in `0700` directories.
+`<dir>` follows the [XDG Base Directory spec][xdg]: `$XDG_RUNTIME_DIR/ziiring`
+(tmpfs, cleared at logout) when that directory is usable (absolute, owned by you,
+mode `0700`), else `$XDG_CACHE_HOME/ziiring`, else `~/.cache/ziiring`. Files are
+mode `0600` in `0700` directories. User keysets live in `<dir>/user/`, and each
+session's in `<dir>/session-<keyring id>/`.
+
+[xdg]: https://specifications.freedesktop.org/basedir-spec/latest/
 
 **File format.** `"ZIR1" | generation (16) | expiry (8) | nonce (24) | ciphertext+tag`.
 The header is cleartext so readers can find the right key and prune expired

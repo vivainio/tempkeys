@@ -6,7 +6,7 @@ use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
@@ -29,8 +29,8 @@ const EXT: &str = ".enc";
 /// By default the key lives in your user keyring (@u), so every process running
 /// as your UID can use the keyset. With --session it lives in a private session
 /// keyring created by `ziiring session`, usable only by that process family.
-/// Root can always read either. Files go in $ZIIRING_DIR, else
-/// $XDG_RUNTIME_DIR/ziiring, else ~/.cache/ziiring.
+/// Root can always read either. Files go in $XDG_RUNTIME_DIR/ziiring, falling
+/// back to $XDG_CACHE_HOME/ziiring (default ~/.cache/ziiring).
 #[derive(Parser)]
 #[command(version)]
 struct Cli {
@@ -179,18 +179,25 @@ impl Scope {
 
 const SESSION_DIR_PREFIX: &str = "session-";
 
+/// `$XDG_RUNTIME_DIR` if it is usable as the XDG Base Directory spec requires:
+/// absolute, a directory we own, and closed to everyone else.
+fn runtime_dir() -> Option<PathBuf> {
+    let dir = PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty())?);
+    let meta = fs::metadata(&dir).ok()?;
+    // SAFETY: geteuid has no preconditions.
+    let mine = meta.uid() == unsafe { libc::geteuid() };
+    (dir.is_absolute() && meta.is_dir() && mine && meta.mode() & 0o077 == 0).then_some(dir)
+}
+
+/// Where ziiring keeps its files, following the XDG Base Directory spec: the
+/// runtime directory (tmpfs, per login), else `$XDG_CACHE_HOME`, else `~/.cache`.
 fn base_dir() -> Res<PathBuf> {
-    let env = |k: &str| std::env::var_os(k).filter(|v| !v.is_empty());
-    let dir = if let Some(d) = env("ZIIRING_DIR") {
-        PathBuf::from(d)
-    } else if let Some(d) = env("XDG_RUNTIME_DIR") {
-        PathBuf::from(d).join("ziiring")
-    } else if let Some(h) = env("HOME") {
-        PathBuf::from(h).join(".cache/ziiring")
-    } else {
-        return Err("cannot locate a directory: set ZIIRING_DIR".into());
-    };
-    Ok(dir)
+    let env = |k: &str| std::env::var_os(k).map(PathBuf::from).filter(|v| v.is_absolute());
+    let root = runtime_dir()
+        .or_else(|| env("XDG_CACHE_HOME"))
+        .or_else(|| env("HOME").map(|h| h.join(".cache")))
+        .ok_or("cannot locate a directory: XDG_RUNTIME_DIR, XDG_CACHE_HOME and HOME are all unusable")?;
+    Ok(root.join("ziiring"))
 }
 
 fn mkdir_private(path: &Path) -> Res<()> {
