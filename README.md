@@ -25,6 +25,35 @@ $ ziiring clear
 
 [keyrings]: https://man7.org/linux/man-pages/man7/keyrings.7.html
 
+## What Linux provides, and what ziiring adds
+
+The hard part already exists in Linux: the [kernel key retention
+service][kernel-keys]. It holds secrets in kernel memory rather than on disk,
+checks per-key permissions and possession, expires keys on a timer, garbage
+collects them, and lets a process family share a private session keyring across
+`fork` and `exec`. `keyctl` exposes it. ziiring doesn't reimplement any of that;
+it calls the same syscalls (and the kernel's CSPRNG for keys and nonces).
+
+What the raw keyring leaves to you, and what ziiring does about it:
+
+| With plain `keyctl` | With ziiring |
+| --- | --- |
+| A `user` key holds at most 32 KB, and non-root users get about 200 keys and 20 KB in total (`/proc/sys/kernel/keys/`) | The kernel holds one 32-byte key per keyset. Secrets are encrypted files of any size and number |
+| A key is a single opaque payload; there is no "set of secrets" | A keyset is loaded, replaced, merged into (`load --merge`) or edited (`set`) as a unit, and swapped in atomically, so readers never see half of it |
+| Nothing ties stored data to the key's lifetime | When the key expires, is cleared, or the machine reboots, the files are unreadable and pruned, so nothing lingers on disk |
+| Data is only as safe as the permissions on it | Files are XChaCha20-Poly1305 with the keyset and key names and the expiry authenticated: swapped, moved, edited or re-dated files fail to decrypt |
+| A private per-process-family keyring is a manual recipe: join a session, set permissions, add keys, `exec` | `ziiring session` does it in the safe order: permissions are set before any key goes in, members get no right to widen access, and `--session` can't fall into your login's shared keyring |
+| You choose between `@u` and `@s` for every call | Inside a session, reads look in the session scope first and fall back to the user scope per keyset, and writes go to the session; `--user` and `--session` override |
+| Getting a secret to a program means `keyctl search`, `keyctl pipe`, and your own plumbing | `get KEY`, or `run -e GH_TOKEN=github_token -- cmd`, which reports which variables it populated, names only |
+| Needs `keyutils` installed | A single binary; no `keyctl` or `libkeyutils` |
+
+ziiring adds no new trust boundary. The kernel still decides who can fetch the
+key (see [what this does and doesn't protect against](#what-this-does-and-doesnt-protect-against)),
+so the protection is exactly the keyring's: same-UID processes in the user
+scope, one process family in the session scope.
+
+[kernel-keys]: https://docs.kernel.org/security/keys/core.html
+
 ## Install
 
 Linux only, with kernel keyring support (`CONFIG_KEYS`, on in mainstream
@@ -34,6 +63,14 @@ directly.
 ```console
 $ cargo install --git https://github.com/vivainio/ziiring
 ```
+
+## Platforms
+
+Linux, including WSL2 (developed and tested on WSL2, whose kernel has keyring
+support). There is no native Windows or macOS support: ziiring depends on an
+in-kernel keyring with timeouts and per-process-family sessions, which those
+systems don't have. The keyring calls are isolated in `src/sys.rs`, so a port
+would replace that layer rather than rewrite the rest.
 
 ## Commands
 
