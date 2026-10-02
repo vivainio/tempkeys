@@ -54,6 +54,19 @@ jobs:
           name: wheels-${{ matrix.target }}
           path: dist/
 
+      - name: Package binary from wheel
+        run: |
+          mkdir -p extract bin
+          unzip -q dist/*.whl -d extract
+          install -m755 extract/*.data/scripts/tempkeys bin/tempkeys
+          tar -czf "bin/tempkeys-${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz" -C bin tempkeys
+          rm bin/tempkeys
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.target }}
+          path: bin/
+
   build-sdist:
     name: Build sdist
     needs: [check]
@@ -93,3 +106,25 @@ jobs:
       - uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist/
+
+  github-release:
+    name: Upload binaries to GitHub release
+    needs: [build-wheels]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: bin
+          pattern: binary-*
+          merge-multiple: true
+
+      - name: Create release and upload binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 \
+            || gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes
+          gh release upload "$GITHUB_REF_NAME" bin/*.tar.gz --clobber
