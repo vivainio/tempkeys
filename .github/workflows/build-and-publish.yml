@@ -54,13 +54,11 @@ jobs:
           name: wheels-${{ matrix.target }}
           path: dist/
 
-      - name: Package binary from wheel
+      - name: Extract binary from wheel
         run: |
           mkdir -p extract bin
           unzip -q dist/*.whl -d extract
-          install -m755 extract/*.data/scripts/tempkeys bin/tempkeys
-          tar -czf "bin/tempkeys-${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz" -C bin tempkeys
-          rm bin/tempkeys
+          install -m755 extract/*.data/scripts/tempkeys "bin/tempkeys-${GITHUB_REF_NAME}-${{ matrix.target }}"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -127,4 +125,4 @@ jobs:
         run: |
           gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 \
             || gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes
-          gh release upload "$GITHUB_REF_NAME" bin/*.tar.gz --clobber
+          gh release upload "$GITHUB_REF_NAME" bin/tempkeys-* --clobber
